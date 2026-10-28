@@ -1,0 +1,16 @@
+# Local-only issuer. Use the deployed public origin in Wrangler vars when configured.
+MCP_ISSUER_URL=http://localhost:8787
+
+# Local consent bypass works only for loopback requests and only when explicitly true.
+# Do not set this in any deployed environment.
+ALLOW_LOCAL_AUTH=true
+ACCESS_OWNER_EMAIL=developer@example.test
+
+# Optional when exercising a real Access assertion locally.
+ACCESS_TEAM_DOMAIN=
+ACCESS_AUD=
+ACCESS_ADMIN_AUD=
+
+# Authorization grants start empty. Add servers, users, and roles at /admin after deployment.
+DISCORD_BOT_TOKEN=
+DISCORD_BOT_USER_ID=

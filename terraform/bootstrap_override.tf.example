@@ -1,0 +1,8 @@
+# Local first installation only. See docs/deployment.md before enabling.
+# Remove the activated override after the initial registration succeeds.
+resource "cloudflare_workers_script" "discord_dot" {
+  migrations = {
+    new_tag            = "v1"
+    new_sqlite_classes = ["BridgeStateDO"]
+  }
+}

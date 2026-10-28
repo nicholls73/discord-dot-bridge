@@ -1,0 +1,48 @@
+{
+  "name": "discord-dot",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "description": "A Cloudflare Worker and Durable Object Discord mention bridge for a ChatGPT dot.",
+  "scripts": {
+    "build:admin-css": "tailwindcss -i src/styles/admin.css -o src/admin.css.txt --minify",
+    "build:bundle": "WRANGLER_WRITE_LOGS=false wrangler deploy --dry-run --outdir dist/wrangler && esbuild dist/wrangler/index.js --bundle --format=esm --platform=browser --target=es2022 '--external:cloudflare:*' --loader:.txt=text --outfile=dist/index.js",
+    "build": "npm run build:admin-css && npm run build:bundle",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude test/deployment-runtime.test.ts --exclude test/worker-runtime-redirect.test.ts --exclude test/worker-runtime-callback.test.ts --exclude test/worker-runtime-alarm.test.ts --exclude test/terraform-artifact.test.ts",
+    "verify:workers-runtime": "vitest run test/worker-runtime-redirect.test.ts test/worker-runtime-callback.test.ts test/worker-runtime-alarm.test.ts",
+    "verify:production-runtime": "vitest run test/deployment-runtime.test.ts test/worker-runtime-redirect.test.ts test/worker-runtime-callback.test.ts test/worker-runtime-alarm.test.ts",
+    "verify:deployment-artifact": "vitest run test/terraform-artifact.test.ts",
+    "check": "npm test && npm run typecheck && npm run build && npm run verify:deployment-artifact",
+    "dev": "wrangler dev",
+    "dry-run": "npm run build"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.1",
+    "@modelcontextprotocol/server": "2.3.0",
+    "@radix-ui/react-slot": "1.4.0",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "jose": "6.2.12",
+    "lucide-react": "1.54.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "tailwind-merge": "3.7.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261004.1",
+    "@modelcontextprotocol/client": "2.3.0",
+    "@tailwindcss/cli": "4.3.0",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "esbuild": "0.28.1",
+    "miniflare": "5.20261001.0-alpha",
+    "tailwindcss": "4.3.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "wrangler": "4.147.0"
+  }
+}

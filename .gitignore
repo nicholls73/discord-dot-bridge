@@ -1,0 +1,37 @@
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+wrangler.production.jsonc
+
+# Node and build output
+node_modules/
+dist/
+coverage/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+terraform/*.tfvars
+terraform/*.tfvars.json
+terraform/*.backend.hcl
+terraform/*_override.tf
+terraform/*_override.tf.json
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases and state
+*.sqlite
+*.sqlite-*
+*.db
+
+# OS and editor files
+.DS_Store
+Thumbs.db

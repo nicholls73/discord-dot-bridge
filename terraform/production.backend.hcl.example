@@ -1,0 +1,4 @@
+# Copy to production.backend.hcl and replace these non-secret settings.
+# Supply AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY through the environment.
+bucket    = "YOUR_PRIVATE_STATE_BUCKET"
+endpoints = { s3 = "https://YOUR_R2_ACCOUNT_ID.r2.cloudflarestorage.com" }

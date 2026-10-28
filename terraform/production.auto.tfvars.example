@@ -1,0 +1,9 @@
+# Copy to production.auto.tfvars for local deployment, then replace every value.
+# The real file is ignored. GitHub Actions uses production environment variables.
+# Supply credentials through environment variables, never in this file.
+account_id                  = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+owner_email                 = "owner@example.test"
+workers_dev_subdomain       = "YOUR_WORKERS_DEV_SUBDOMAIN"
+access_team_domain          = "YOUR_TEAM.cloudflareaccess.com"
+access_identity_provider_id = "YOUR_ACCESS_IDENTITY_PROVIDER_ID"
+discord_bot_user_id         = "YOUR_DISCORD_APPLICATION_ID"

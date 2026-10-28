@@ -1,0 +1,43 @@
+(() => {
+  const field = document.getElementById('codex-mcp-url');
+  const button = document.getElementById('codex-mcp-copy-button');
+  const status = document.getElementById('codex-mcp-copy');
+  if (!field || !button || !status) return;
+  const help = status.textContent;
+  let copying = false;
+  let reset;
+
+  button.addEventListener('click', async () => {
+    if (copying) return;
+    copying = true;
+    button.setAttribute('aria-disabled', 'true');
+    clearTimeout(reset);
+    status.textContent = 'Copying…';
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(field.value);
+      copied = true;
+    } catch {
+      // Older browsers and denied clipboard permissions can still allow a user-initiated copy.
+      const focused = document.activeElement;
+      const start = field.selectionStart;
+      const end = field.selectionEnd;
+      const direction = field.selectionDirection;
+      field.focus({ preventScroll: true });
+      field.select();
+      try {
+        copied = document.execCommand('copy');
+      } catch {
+        copied = false;
+      }
+      if (copied) {
+        field.setSelectionRange(start, end, direction);
+        focused?.focus({ preventScroll: true });
+      }
+    }
+    copying = false;
+    button.removeAttribute('aria-disabled');
+    status.textContent = copied ? 'Copied' : 'Could not copy. Select and copy this URL.';
+    if (copied) reset = setTimeout(() => { status.textContent = help; }, 2000);
+  });
+})();
