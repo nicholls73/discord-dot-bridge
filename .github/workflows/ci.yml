@@ -2,7 +2,6 @@ name: CI
 
 on:
   pull_request:
-  push:
     branches: [main]
   workflow_dispatch:
 
@@ -14,7 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  build:
+    name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -26,11 +26,72 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run check
+      - run: npm run build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: worker-${{ github.sha }}
+          path: dist/index.js
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    name: Test
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: worker-${{ github.sha }}
+          path: dist/
+      - run: npm test
       - run: npm run verify:production-runtime
+      - run: npm run verify:deployment-artifact
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.16.0
+          terraform_wrapper: false
       - run: terraform -chdir=terraform fmt -check -recursive
+
+  validate:
+    name: Validate
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: worker-${{ github.sha }}
+          path: dist/
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.0
+          terraform_wrapper: false
       - run: terraform -chdir=terraform init -backend=false -input=false -lockfile=readonly
       - run: terraform -chdir=terraform validate -no-color

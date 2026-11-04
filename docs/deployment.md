@@ -101,27 +101,34 @@ After the first local installation, configure a GitHub environment named
 `production`, restricted to `main`. Use the same installation's settings;
 local `.tfvars` files are not available in Actions.
 
-| Kind | GitHub environment name | Value |
-| --- | --- | --- |
-| Variable | `CLOUDFLARE_ACCOUNT_ID` | Worker/Access account ID |
-| Variable | `ACCESS_OWNER_EMAIL` | Exact owner login email |
-| Variable | `WORKERS_DEV_SUBDOMAIN` | Account subdomain label only |
-| Variable | `ACCESS_TEAM_DOMAIN` | Team host ending in `.cloudflareaccess.com` |
-| Variable | `ACCESS_IDENTITY_PROVIDER_ID` | Selected existing provider ID |
-| Variable | `DISCORD_BOT_USER_ID` | Bot/application ID |
-| Variable | `TF_STATE_R2_ACCOUNT_ID` | State bucket's account ID |
-| Variable | `TF_STATE_R2_BUCKET` | State bucket name |
-| Variable | `TF_STATE_R2_ACCESS_KEY_ID` | State access key ID |
-| Secret | `CLOUDFLARE_API_TOKEN` | Deployment token |
-| Secret | `DISCORD_BOT_TOKEN` | Bot token |
-| Secret | `DISCORD_OAUTH_CLIENT_SECRET` | OAuth client secret for account linking |
-| Secret | `TF_STATE_R2_SECRET_ACCESS_KEY` | State secret access key |
+Store every value below as an environment **secret** to mask account details in
+public workflow logs. Variables remain supported for nonconfidential settings.
 
-The [Deploy workflow](../.github/workflows/deploy.yml) runs on pushes to `main`
-and manual dispatches on `main`. It checks the runtime/build, rejects missing
-settings, then applies Terraform. Configure the environment before using it.
-Protect `main` and require deployment approval as appropriate for your account.
-Contributor CI requires no production credentials.
+| GitHub environment name | Value |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | Worker/Access account ID |
+| `ACCESS_OWNER_EMAIL` | Exact owner login email |
+| `WORKERS_DEV_SUBDOMAIN` | Account subdomain label only |
+| `ACCESS_TEAM_DOMAIN` | Team host ending in `.cloudflareaccess.com` |
+| `ACCESS_IDENTITY_PROVIDER_ID` | Selected existing provider ID |
+| `DISCORD_BOT_USER_ID` | Bot/application ID |
+| `TF_STATE_R2_ACCOUNT_ID` | State bucket's account ID |
+| `TF_STATE_R2_BUCKET` | State bucket name |
+| `TF_STATE_R2_ACCESS_KEY_ID` | State access key ID |
+| `CLOUDFLARE_API_TOKEN` | Deployment token |
+| `DISCORD_BOT_TOKEN` | Bot token |
+| `DISCORD_OAUTH_CLIENT_SECRET` | OAuth client secret for account linking |
+| `TF_STATE_R2_SECRET_ACCESS_KEY` | State secret access key |
+
+The [Deploy workflow](../.github/workflows/deploy.yml) builds the pushed commit
+and verifies a Terraform plan before applying an update. It rejects resource
+creation, deletion, storage replacement, bot/endpoint changes and replayed
+bootstrap migrations. First installations still use the local procedure above.
+Require the applicable CI jobs before merging into `main`. Restrict the production
+environment to `main` and require owner approval before enabling deployment.
+Configure all settings first.
+Contributor CI requires no production credentials. Raw plan output stays on the
+runner; if planning fails, diagnose with a private local Terraform plan.
 
 ## Finish setup and update
 
