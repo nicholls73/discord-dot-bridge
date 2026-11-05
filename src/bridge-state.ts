@@ -165,9 +165,14 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       return 'rejected';
     }
 
+    let roleIds = member.roleIds;
     if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
       const content = await this.readBotRoleMention(origin);
       if (content === null) return 'rejected';
+      // The role/message lookup may outlive the sender's Discord access.
+      const refreshedMember = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
+      if (refreshedMember.status !== 'member') return 'rejected';
+      roleIds = refreshedMember.roleIds;
       origin = { ...origin, content };
     }
 
@@ -175,7 +180,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     const now = this.now();
     const result = await this.ctx.storage.transaction(async (transaction) => {
       const current = decodeDiscordAuthorization(await transaction.get<unknown>(AUTHORIZATION_KEY));
-      if (!hasDiscordAccess(current, origin.guildId, origin.authorId, member.roleIds)) return 'rejected' as const;
+      if (!hasDiscordAccess(current, origin.guildId, origin.authorId, roleIds)) return 'rejected' as const;
       if (await transaction.get<OriginMessage>(originKey)) return false;
       if (!await transaction.get(RECOVERY_CURSOR_KEY)) {
         await transaction.put(RECOVERY_CURSOR_KEY, crypto.getRandomValues(new Uint8Array(32)));

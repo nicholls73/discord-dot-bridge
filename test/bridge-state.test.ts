@@ -712,6 +712,7 @@ describe('BridgeState managed bot role mentions', () => {
       `https://discord.com/api/v10/guilds/${candidate.guildId}/members/${candidate.authorId}`,
       `https://discord.com/api/v10/guilds/${candidate.guildId}/roles`,
       `https://discord.com/api/v10/channels/${candidate.channelId}/messages/${candidate.messageId}`,
+      `https://discord.com/api/v10/guilds/${candidate.guildId}/members/${candidate.authorId}`,
     ]);
     await expect(bridge.getOrigin(candidate.messageId)).resolves.toMatchObject({ content: message.content });
     await expect(bridge.recordMention(roleCandidate)).resolves.toMatchObject({ status: 'duplicate' });
@@ -723,7 +724,7 @@ describe('BridgeState managed bot role mentions', () => {
     const { bridge, calls } = await setup();
     await expect(bridge.recordMention({ ...roleCandidate, content: message.content }))
       .resolves.toMatchObject({ status: 'accepted' });
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
     expect(calls.some((url) => url.includes('/messages/'))).toBe(false);
     await expect(bridge.getOrigin(candidate.messageId)).resolves.toMatchObject({ content: message.content });
   });
@@ -857,6 +858,50 @@ describe('BridgeState managed bot role mentions', () => {
     await expect(bridge.getOrigin(candidate.messageId)).resolves.toBeNull();
     expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
     expect((await storage.list({ prefix: 'delivery:' })).size).toBe(0);
+  });
+
+  it.each(['Gateway content', 'REST content'])(
+    'rejects %s when Discord removes the sender role during verification', async (contentSource) => {
+      const { bridge, storage, discordFetch } = await setup();
+      const subscription = testSubscription(Date.parse(candidate.timestamp));
+      await storage.put(`subscription:${subscription.id}`, subscription);
+      const accessRole = '77777777777777777';
+      let memberRoles = [accessRole];
+      await bridge.mutateDiscordAuthorization({ action: 'grant-role', guildId: candidate.guildId, id: accessRole });
+      await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+      const read = discordFetch.getMockImplementation()!;
+      discordFetch.mockImplementation(async (input, init) => {
+        if (String(input).includes('/members/')) return memberFetch(() => memberRoles)(input);
+        const response = await read(input, init);
+        if (String(input).endsWith(contentSource === 'Gateway content' ? '/roles' : `/messages/${candidate.messageId}`)) {
+          memberRoles = [];
+        }
+        return response;
+      });
+      await expect(bridge.recordMention({ ...roleCandidate,
+        content: contentSource === 'Gateway content' ? message.content : '',
+      })).resolves.toMatchObject({ status: 'rejected' });
+      expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+      expect((await storage.list({ prefix: 'delivery:' })).size).toBe(0);
+      expect((await storage.list({ prefix: 'typing:' })).size).toBe(0);
+    },
+  );
+
+  it.each([404, 503])('rejects a role mention when the final membership check returns %s', async (status) => {
+    const { bridge, storage, discordFetch } = await setup();
+    const subscription = testSubscription(Date.parse(candidate.timestamp));
+    await storage.put(`subscription:${subscription.id}`, subscription);
+    const read = discordFetch.getMockImplementation()!;
+    let memberReads = 0;
+    discordFetch.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members/') && ++memberReads > 1) return new Response(null, { status });
+      return read(input, init);
+    });
+    await expect(bridge.recordMention(roleCandidate)).resolves.toMatchObject({ status: 'rejected' });
+    expect(memberReads).toBe(2);
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+    expect((await storage.list({ prefix: 'delivery:' })).size).toBe(0);
+    expect((await storage.list({ prefix: 'typing:' })).size).toBe(0);
   });
 });
 
