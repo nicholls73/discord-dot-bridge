@@ -67,9 +67,44 @@ describe('Discord Gateway protocol', () => {
         authorDisplayName: 'Synthetic user',
         authorIsBot: false,
         mentionedUserIds: ['22222222222222222'],
+        mentionedRoleIds: [],
         content: '<@22222222222222222> review this',
         timestamp: '2026-10-04T12:00:00.000Z',
       },
+    });
+  });
+
+  it('keeps top-level role mentions on a reply without inheriting the referenced message', () => {
+    const protocol = new DiscordGatewayProtocol('test-bot-token');
+    const commands = protocol.receive(gateway(0, {
+      id: '66666666666666666', guild_id: '11111111111111111', channel_id: '55555555555555555',
+      type: 19, timestamp: '2026-10-04T12:00:00.000Z', content: '',
+      author: { id: '33333333333333333', username: 'Synthetic sender' },
+      mentions: [{ id: '77777777777777777' }], mention_roles: ['44444444444444444'],
+      message_reference: { message_id: '88888888888888888', channel_id: '55555555555555555' },
+      referenced_message: {
+        id: '88888888888888888', author: { id: '77777777777777777' },
+        content: 'Quoted text', mentions: [{ id: '22222222222222222' }], mention_roles: ['99999999999999999'],
+      },
+    }, { s: 18, t: 'MESSAGE_CREATE' }));
+    expect(commands.find((command) => command.type === 'mention')).toMatchObject({
+      candidate: {
+        messageId: '66666666666666666', authorId: '33333333333333333', content: '',
+        mentionedUserIds: ['77777777777777777'], mentionedRoleIds: ['44444444444444444'],
+      },
+    });
+  });
+
+  it('marks webhook role mentions as bot-authored even without an author bot flag', () => {
+    const protocol = new DiscordGatewayProtocol('test-bot-token');
+    const commands = protocol.receive(gateway(0, {
+      id: '66666666666666666', guild_id: '11111111111111111', channel_id: '55555555555555555',
+      timestamp: '2026-10-04T12:00:00.000Z', content: '<@&44444444444444444> webhook text',
+      author: { id: '33333333333333333', username: 'Synthetic webhook' },
+      webhook_id: '33333333333333333', mentions: [], mention_roles: ['44444444444444444'],
+    }, { s: 19, t: 'MESSAGE_CREATE' }));
+    expect(commands.find((command) => command.type === 'mention')).toMatchObject({
+      candidate: { authorIsBot: true },
     });
   });
 

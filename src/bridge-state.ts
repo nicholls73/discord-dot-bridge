@@ -165,11 +165,22 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       return 'rejected';
     }
 
+    let roleIds = member.roleIds;
+    if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
+      const content = await this.readBotRoleMention(origin);
+      if (content === null) return 'rejected';
+      // The role/message lookup may outlive the sender's Discord access.
+      const refreshedMember = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
+      if (refreshedMember.status !== 'member') return 'rejected';
+      roleIds = refreshedMember.roleIds;
+      origin = { ...origin, content };
+    }
+
     const originKey = `origin:${origin.eventId}`;
     const now = this.now();
     const result = await this.ctx.storage.transaction(async (transaction) => {
       const current = decodeDiscordAuthorization(await transaction.get<unknown>(AUTHORIZATION_KEY));
-      if (!hasDiscordAccess(current, origin.guildId, origin.authorId, member.roleIds)) return 'rejected' as const;
+      if (!hasDiscordAccess(current, origin.guildId, origin.authorId, roleIds)) return 'rejected' as const;
       if (await transaction.get<OriginMessage>(originKey)) return false;
       if (!await transaction.get(RECOVERY_CURSOR_KEY)) {
         await transaction.put(RECOVERY_CURSOR_KEY, crypto.getRandomValues(new Uint8Array(32)));
@@ -988,6 +999,41 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     return hasDiscordAccess(authorization, origin.guildId, origin.authorId, member.roleIds)
       ? 'authorized'
       : 'revoked';
+  }
+
+  private async readBotRoleMention(origin: OriginMessage): Promise<string | null> {
+    const token = this.env.DISCORD_BOT_TOKEN?.trim();
+    if (!token) return null;
+    const read = async (path: string) => {
+      const response = await fetchWithoutRedirect(this.discordFetch, `https://discord.com/api/v10${path}`, {
+        method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(10_000),
+        headers: { authorization: `Bot ${token}`, accept: 'application/json' },
+      });
+      if (!response.ok) throw new Error('Discord mention lookup failed.');
+      return response.json() as Promise<any>;
+    };
+    try {
+      const roles = await read(`/guilds/${origin.guildId}/roles`);
+      if (!Array.isArray(roles)) return null;
+      const role = roles.find((value) => value?.managed === true &&
+        value.tags?.bot_id === this.env.DISCORD_BOT_USER_ID && origin.mentionedRoleIds?.includes(value.id));
+      if (!role) return null;
+      if (origin.content !== '') {
+        return origin.content.includes(`<@&${role.id}>`) ? origin.content : null;
+      }
+      // Role pings can lack Gateway content; REST uses the app's existing content access.
+      const message = await read(`/channels/${origin.channelId}/messages/${origin.messageId}`);
+      if (!message || message.id !== origin.messageId || message.channel_id !== origin.channelId ||
+          (message.guild_id !== undefined && message.guild_id !== origin.guildId) ||
+          message.author?.id !== origin.authorId || message.author.bot === true || message.webhook_id !== undefined ||
+          typeof message.timestamp !== 'string' || Date.parse(message.timestamp) !== Date.parse(origin.timestamp) ||
+          !Array.isArray(message.mention_roles) || !message.mention_roles.includes(role.id) ||
+          typeof message.content !== 'string' || message.content.length > 2000 ||
+          !message.content.includes(`<@&${role.id}>`)) return null;
+      return message.content;
+    } catch {
+      return null;
+    }
   }
 
   private async getCurrentMemberRoles(
