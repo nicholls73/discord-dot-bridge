@@ -1,8 +1,9 @@
-import { isAllowedOrigin, toOriginMessage, validateMentionCandidate } from './policy.js';
+import { toOriginMessage, validateMessageCandidate } from './policy.js';
 import type { EventAuthorizationReference } from './events.js';
 import type { GatewayMentionCandidate, OriginMessage } from './policy.js';
 
 export interface OriginStore {
+  /** Verify the sender and mention or bot-thread trigger before persisting. */
   recordOriginOnce(origin: OriginMessage): Promise<'accepted' | 'duplicate' | 'rejected'>;
   getOrigin(eventId: string): Promise<OriginMessage | null>;
   isOriginAuthorized(origin: OriginMessage): Promise<boolean>;
@@ -17,11 +18,10 @@ export async function ingestMention(
   botUserId: string | undefined,
   store: OriginStore,
 ): Promise<IngestMentionResult> {
-  const rejection = validateMentionCandidate(candidate, botUserId);
+  const rejection = validateMessageCandidate(candidate, botUserId);
   if (rejection) return { status: 'rejected', reason: rejection };
 
   const origin = toOriginMessage(candidate);
-  if (!isAllowedOrigin(origin, botUserId)) return { status: 'rejected', reason: 'origin_not_allowed' };
   const result = await store.recordOriginOnce(origin);
   return result === 'rejected'
     ? { status: 'rejected', reason: 'author_not_allowed' }

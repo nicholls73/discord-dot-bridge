@@ -45,11 +45,10 @@ describe('mention origin store', () => {
     expect(origin?.messageUrl).toBe('https://discord.com/channels/11111111111111111/55555555555555555/66666666666666666');
   });
 
-  it('rejects unconfigured, bot-authored, and non-mention events without storing them', async () => {
+  it('rejects unconfigured and bot-authored events before consulting the origin store', async () => {
     const store = memoryStore();
     await expect(ingestMention(candidate(), undefined, store)).resolves.toMatchObject({ status: 'rejected' });
     await expect(ingestMention(candidate({ authorIsBot: true }), BOT, store)).resolves.toMatchObject({ status: 'rejected' });
-    await expect(ingestMention(candidate({ mentionedUserIds: [] }), BOT, store)).resolves.toMatchObject({ status: 'rejected' });
     await expect(store.getOrigin('66666666666666666')).resolves.toBeNull();
   });
 

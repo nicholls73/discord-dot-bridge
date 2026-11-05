@@ -480,7 +480,7 @@ describe('BridgeState Durable Object outbox', () => {
     expect(storage.alarm).toBeNull();
   });
 
-  it.each(['user', 'managed role'])('carries a %s mention in a reply through durable MCP Events delivery and a reply to the same origin', async (mentionKind) => {
+  it.each(['user', 'managed role', 'thread follow-up'])('carries a %s through durable MCP Events delivery and a reply to the same origin', async (mentionKind) => {
     class MockGatewaySocket {
       readyState = 1;
       sent: string[] = [];
@@ -506,12 +506,13 @@ describe('BridgeState Durable Object outbox', () => {
     const mention = mentionKind === 'user' ? '<@22222222222222222>' : '<@&44444444444444444>';
     const message = {
       id: candidate.messageId, guild_id: candidate.guildId, channel_id: candidate.channelId,
-      type: 19, timestamp: candidate.timestamp,
-      content: `${mention} please review the synthetic example checklist`,
+      type: mentionKind === 'thread follow-up' ? 0 : 19, timestamp: candidate.timestamp,
+      content: mentionKind === 'thread follow-up' ? 'Please summarise that checklist.' : `${mention} please review the synthetic example checklist`,
       author: { id: candidate.authorId, username: 'Synthetic user', bot: false },
       member: { nick: 'Synthetic user' },
-      mentions: [{ id: '88888888888888888' }, ...(mentionKind === 'user' ? [{ id: env.DISCORD_BOT_USER_ID }] : [])],
-      mention_roles: mentionKind === 'user' ? [] : [ROLE],
+      mentions: mentionKind === 'thread follow-up' ? []
+        : [{ id: '88888888888888888' }, ...(mentionKind === 'user' ? [{ id: env.DISCORD_BOT_USER_ID }] : [])],
+      mention_roles: mentionKind === 'managed role' ? [ROLE] : [],
       message_reference: { message_id: '99999999999999999', channel_id: candidate.channelId },
       referenced_message: { id: '99999999999999999', author: { id: '88888888888888888' }, content: 'Synthetic checklist' },
     };
@@ -522,6 +523,13 @@ describe('BridgeState Durable Object outbox', () => {
         return Response.json([{ id: ROLE, managed: true, tags: { bot_id: env.DISCORD_BOT_USER_ID } }]);
       }
       if (url.endsWith(`/channels/${candidate.channelId}/messages/${candidate.messageId}`)) return Response.json(message);
+      if (url.endsWith(`/channels/${candidate.channelId}`)) return Response.json({
+        id: candidate.channelId, guild_id: candidate.guildId, type: 11, parent_id: '77777777777777777',
+      });
+      if (url.endsWith(`/channels/77777777777777777/messages/${candidate.channelId}`)) return Response.json({
+        id: candidate.channelId, channel_id: '77777777777777777',
+        author: { id: env.DISCORD_BOT_USER_ID, bot: true }, content: 'Which checklist should I review?',
+      });
       return memberFetch()(input);
     });
     const runtime = {
@@ -641,7 +649,12 @@ describe('BridgeState Durable Object outbox', () => {
         { eventId: '66666666666666666', messageId: '66666666666666666', timestamp: candidate.timestamp, status: 'pending' },
       ]);
       const read = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: '66666666666666666' } });
-      expect(JSON.parse((read.content[0] as { text: string }).text).messageId).toBe('66666666666666666');
+      const readOrigin = JSON.parse((read.content[0] as { text: string }).text);
+      expect(readOrigin.messageId).toBe('66666666666666666');
+      if (mentionKind === 'thread follow-up') expect(readOrigin.thread).toEqual({
+        parentChannelId: '77777777777777777', starterMessageId: candidate.channelId,
+        starterText: 'Which checklist should I review?',
+      });
       const result = await client.callTool({
         name: 'discord_reply_to_origin',
         arguments: { eventId: '66666666666666666', text: 'Reviewed the checklist.' },
@@ -674,6 +687,147 @@ describe('BridgeState Durable Object outbox', () => {
   });
 });
 
+describe('BridgeState bot thread follow-ups', () => {
+  const parentId = '77777777777777777';
+  const followUp = { ...candidate, mentionedUserIds: [], content: '' };
+  const channel = { id: candidate.channelId, guild_id: candidate.guildId, type: 11, parent_id: parentId };
+  const starter = {
+    id: candidate.channelId, channel_id: parentId,
+    author: { id: '22222222222222222', bot: true }, content: 'Which checklist should I review?',
+  };
+  const message = {
+    id: candidate.messageId, channel_id: candidate.channelId, guild_id: candidate.guildId,
+    author: { id: candidate.authorId, bot: false }, timestamp: candidate.timestamp,
+    content: 'Please summarise that checklist.',
+  };
+
+  async function setup(overrides: { channel?: unknown; starter?: unknown; message?: unknown } = {}) {
+    const storage = new MemoryStorage();
+    const discordFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/members/')) return memberFetch()(input);
+      expect(init).toMatchObject({ method: 'GET', cache: 'no-store', redirect: 'manual' });
+      if (url.endsWith(`/channels/${candidate.channelId}`)) return Response.json('channel' in overrides ? overrides.channel : channel);
+      if (url.endsWith(`/channels/${parentId}/messages/${candidate.channelId}`)) return Response.json('starter' in overrides ? overrides.starter : starter);
+      if (url.endsWith(`/channels/${candidate.channelId}/messages/${candidate.messageId}`)) return Response.json('message' in overrides ? overrides.message : message);
+      throw new Error('Unexpected Discord request');
+    });
+    const bridge = new BridgeStateDO({ storage, waitUntil: () => undefined } as never, testEnv(), {
+      ...testRuntime(), discordFetch,
+    });
+    await grantUser(bridge);
+    return { bridge, storage, discordFetch };
+  }
+
+  it.each([10, 11])('accepts plain follow-ups in a bot-rooted thread of type %s and retains the real destination', async (type) => {
+    const { bridge, storage } = await setup({ channel: { ...channel, type } });
+    const results = await Promise.all([bridge.recordMention(followUp), bridge.recordMention(followUp)]);
+    expect(results.map((result) => result.status).sort()).toEqual(['accepted', 'duplicate']);
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(1);
+    await expect(bridge.getOrigin(candidate.messageId)).resolves.toMatchObject({
+      channelId: candidate.channelId, messageId: candidate.messageId, content: message.content,
+      mentionedUserIds: [],
+      thread: { parentChannelId: parentId, starterMessageId: candidate.channelId, starterText: starter.content },
+    });
+    await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+    await expect(bridge.getOrigin(candidate.messageId)).resolves.toBeNull();
+  });
+
+  it('uses available Gateway text without fetching the follow-up again', async () => {
+    const { bridge, discordFetch } = await setup();
+    await expect(bridge.recordMention({ ...followUp, content: message.content })).resolves.toMatchObject({ status: 'accepted' });
+    expect(discordFetch.mock.calls.some(([url]) => String(url).endsWith(`/messages/${candidate.messageId}`))).toBe(false);
+  });
+
+  it('skips repeated ordinary channel traffic while still accepting an explicit mention there', async () => {
+    const { bridge, discordFetch } = await setup({ channel: { ...channel, type: 0 } });
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    const calls = discordFetch.mock.calls.length;
+    await expect(bridge.recordMention({ ...followUp, messageId: '88888888888888888' })).resolves.toMatchObject({ status: 'rejected' });
+    expect(discordFetch.mock.calls).toHaveLength(calls);
+    await expect(bridge.recordMention(candidate)).resolves.toMatchObject({ status: 'accepted' });
+  });
+
+  it('cannot use caller-supplied thread context to enable an unrelated thread', async () => {
+    const { bridge, storage } = await setup({ starter: { ...starter, author: { id: candidate.authorId } } });
+    const forged = { ...followUp, thread: {
+      parentChannelId: parentId, starterMessageId: candidate.channelId, starterText: starter.content,
+    } };
+    await expect(bridge.recordMention(forged)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+  });
+
+  it('rechecks live membership after reading the thread', async () => {
+    const { bridge, discordFetch, storage } = await setup();
+    const read = discordFetch.getMockImplementation()!;
+    let members = 0;
+    discordFetch.mockImplementation(async (input, init) => {
+      if (String(input).includes('/members/') && ++members > 1) return new Response(null, { status: 404 });
+      return read(input, init);
+    });
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+  });
+
+  it.each([
+    ['ordinary channel', { channel: { ...channel, type: 0 } }],
+    ['private thread', { channel: { ...channel, type: 12 } }],
+    ['different channel', { channel: { ...channel, id: '88888888888888888' } }],
+    ['different guild', { channel: { ...channel, guild_id: '88888888888888888' } }],
+    ['malformed parent', { channel: { ...channel, parent_id: '../messages' } }],
+    ['human starter', { starter: { ...starter, author: { id: candidate.authorId } } }],
+    ['another bot starter', { starter: { ...starter, author: { id: '88888888888888888', bot: true } } }],
+    ['webhook starter', { starter: { ...starter, webhook_id: '88888888888888888' } }],
+    ['different starter message', { starter: { ...starter, id: '88888888888888888' } }],
+    ['different starter channel', { starter: { ...starter, channel_id: '88888888888888888' } }],
+    ['different starter guild', { starter: { ...starter, guild_id: '88888888888888888' } }],
+    ['missing starter', { starter: null }],
+    ['withheld content', { message: { ...message, content: '' } }],
+    ['whitespace content', { message: { ...message, content: '  ' } }],
+    ['oversized content', { message: { ...message, content: 'x'.repeat(2001) } }],
+    ['different incoming message', { message: { ...message, id: '88888888888888888' } }],
+    ['different incoming channel', { message: { ...message, channel_id: parentId } }],
+    ['different incoming guild', { message: { ...message, guild_id: '88888888888888888' } }],
+    ['different incoming author', { message: { ...message, author: { id: '88888888888888888' } } }],
+    ['bot incoming author', { message: { ...message, author: { id: candidate.authorId, bot: true } } }],
+    ['webhook incoming author', { message: { ...message, webhook_id: '88888888888888888' } }],
+    ['different incoming timestamp', { message: { ...message, timestamp: '2026-10-04T12:01:00.000Z' } }],
+  ])('does not wake Dot for %s', async (_label, overrides) => {
+    const { bridge, storage } = await setup(overrides);
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+    expect((await storage.list({ prefix: 'delivery:' })).size).toBe(0);
+  });
+
+  it.each(['channel', 'starter', 'message'])('fails closed when the %s lookup fails', async (stage) => {
+    const { bridge, discordFetch, storage } = await setup();
+    const read = discordFetch.getMockImplementation()!;
+    const path = stage === 'channel' ? `/channels/${candidate.channelId}`
+      : stage === 'starter' ? `/channels/${parentId}/messages/${candidate.channelId}`
+        : `/channels/${candidate.channelId}/messages/${candidate.messageId}`;
+    discordFetch.mockImplementation(async (input, init) => String(input).endsWith(path)
+      ? new Response(null, { status: 403 }) : read(input, init));
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+  });
+
+  it('checks sender access before reading thread content and rechecks revocation during lookup', async () => {
+    const { bridge, discordFetch, storage } = await setup();
+    await expect(bridge.recordMention({ ...followUp, authorId: '88888888888888888' })).resolves.toMatchObject({ status: 'rejected' });
+    expect(discordFetch.mock.calls.every(([url]) => String(url).includes('/members/'))).toBe(true);
+    const read = discordFetch.getMockImplementation()!;
+    discordFetch.mockImplementation(async (input, init) => {
+      const response = await read(input, init);
+      if (String(input).endsWith(`/messages/${candidate.messageId}`)) {
+        await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+      }
+      return response;
+    });
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+  });
+});
+
 describe('BridgeState managed bot role mentions', () => {
   const roleCandidate = {
     ...candidate, mentionedUserIds: ['88888888888888888'], mentionedRoleIds: [ROLE], content: '',
@@ -693,6 +847,9 @@ describe('BridgeState managed bot role mentions', () => {
       calls.push(url);
       if (url.includes('/members/')) return memberFetch()(input);
       expect(init).toMatchObject({ method: 'GET', cache: 'no-store', redirect: 'manual' });
+      if (url.endsWith(`/channels/${candidate.channelId}`)) return Response.json({
+        id: candidate.channelId, guild_id: candidate.guildId, type: 0,
+      });
       if (options.response) return options.response();
       if (url.endsWith('/roles')) return Response.json(options.roles === undefined ? [botRole] : options.roles);
       if (url.endsWith(`/messages/${candidate.messageId}`)) return Response.json(options.message === undefined ? message : options.message);
@@ -733,7 +890,7 @@ describe('BridgeState managed bot role mentions', () => {
     const { bridge, storage, calls } = await setup();
     await expect(bridge.recordMention({ ...roleCandidate, content: 'Ordinary text' }))
       .resolves.toMatchObject({ status: 'rejected' });
-    expect(calls).toHaveLength(2);
+    expect(calls.some((url) => url.includes('/messages/'))).toBe(false);
     expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
   });
 
@@ -757,7 +914,7 @@ describe('BridgeState managed bot role mentions', () => {
   ])('rejects %s without reading a message', async (_label, roles) => {
     const { bridge, storage, calls } = await setup({ roles });
     await expect(bridge.recordMention(roleCandidate)).resolves.toMatchObject({ status: 'rejected' });
-    expect(calls).toHaveLength(2);
+    expect(calls.some((url) => url.includes('/messages/'))).toBe(false);
     expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
   });
 
@@ -784,7 +941,8 @@ describe('BridgeState managed bot role mentions', () => {
   it.each([302, 403, 404, 429, 500])('fails closed on Discord HTTP %s without retrying', async (status) => {
     const { bridge, calls } = await setup({ response: () => new Response(null, { status }) });
     await expect(bridge.recordMention(roleCandidate)).resolves.toMatchObject({ status: 'rejected' });
-    expect(calls).toHaveLength(2);
+    expect(calls.filter((url) => url.endsWith('/roles'))).toHaveLength(1);
+    expect(calls.some((url) => url.includes('/messages/'))).toBe(false);
   });
 
   it.each([302, 403, 404, 429, 500, 'invalid JSON', 'network failure'])(
@@ -799,7 +957,7 @@ describe('BridgeState managed bot role mentions', () => {
           ? new Response(null, { status: failure }) : new Response('not JSON');
       });
       await expect(bridge.recordMention(roleCandidate)).resolves.toMatchObject({ status: 'rejected' });
-      expect(calls).toHaveLength(3);
+      expect(calls.filter((url) => url.includes('/messages/'))).toHaveLength(1);
       expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
       expect((await storage.list({ prefix: 'delivery:' })).size).toBe(0);
     },
@@ -815,7 +973,7 @@ describe('BridgeState managed bot role mentions', () => {
   ])('does not resolve roles or read content for %s', async (_label, rejected) => {
     const { bridge, calls } = await setup();
     await expect(bridge.recordMention(rejected)).resolves.toMatchObject({ status: 'rejected' });
-    expect(calls.every((url) => url.includes('/members/'))).toBe(true);
+    expect(calls.some((url) => url.endsWith('/roles') || url.includes('/messages/'))).toBe(false);
   });
 
   it.each(['revoke-server', 'revoke-user', 'revoke-role'] as const)(
