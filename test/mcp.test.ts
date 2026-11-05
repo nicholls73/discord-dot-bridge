@@ -45,6 +45,7 @@ const noNonceMatch = {
 
 async function connectedClient(scopes: string[], overrides: {
   origin?: OriginMessage | null;
+  originAuthorized?: () => Promise<boolean>;
   messenger?: Partial<DiscordMessenger>;
   listChannels?: (guildId: string) => Promise<DiscordGuildChannel[]>;
   recovery?: MentionRecoveryStore;
@@ -56,9 +57,10 @@ async function connectedClient(scopes: string[], overrides: {
   const origins: OriginStore = {
     recordOriginOnce: async () => 'accepted',
     getOrigin: async (eventId) => eventId === origin.eventId ? storedOrigin : null,
-    isOriginAuthorized: async (candidate) => candidate.guildId === origin.guildId && candidate.eventId === origin.eventId,
+    isOriginAuthorized: overrides.originAuthorized ?? (async (candidate) => candidate.guildId === origin.guildId && candidate.eventId === origin.eventId),
   };
   const messenger: DiscordMessenger = {
+    getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
     replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
     validateChannelWrite: vi.fn(async () => origin.guildId),
     listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),
@@ -127,6 +129,76 @@ async function connectedClient(scopes: string[], overrides: {
 }
 
 describe('authenticated MCP tools', () => {
+  it('does not read conversation history without separate channel-read consent', async () => {
+    const { client, messenger } = await connectedClient([READ_SCOPE, REPLY_SCOPE]);
+    try {
+      const result = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: origin.eventId } });
+      expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({
+        text: origin.content, context: { status: 'requires_channel_read_scope' },
+      });
+      expect(messenger.getOriginContext).not.toHaveBeenCalled();
+    } finally { await client.close(); }
+  });
+
+  it('automatically includes authorized recent messages and references, without private transport fields', async () => {
+    const visible: DiscordChannelMessage = { id: '66666666666666665', channelId: origin.channelId,
+      authorId: origin.authorId, authorDisplayName: 'Morgan', authorIsBot: false, content: 'Please review the proposal', timestamp: origin.timestamp, nonce: 'PRIVATE_NONCE' };
+    const own = { ...visible, id: '66666666666666664', authorId: policyEnv.DISCORD_BOT_USER_ID, authorIsBot: true, content: 'Which proposal?' };
+    const denied = { ...visible, id: '66666666666666663', authorId: '77777777777777777', content: 'PRIVATE_DENIED_MESSAGE' };
+    const otherBot = { ...denied, authorIsBot: true, content: 'PRIVATE_OTHER_BOT' };
+    const { client } = await connectedClient([READ_SCOPE, CHANNEL_READ_SCOPE], {
+      messenger: { getOriginContext: async () => ({ recentMessages: [own, visible, denied, otherBot], referencedMessages: [denied, visible], incomplete: true }) },
+      channelAccess: { isChannelAuthorized: async () => true, isAuthorizedMember: async (_guild, user) => ({ status: user === origin.authorId ? 'authorized' : 'denied' }) },
+    });
+    try {
+      const result = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: origin.eventId } });
+      const text = (result.content[0] as { text: string }).text;
+      const context = JSON.parse(text).context;
+      expect(context).toMatchObject({ status: 'available', incomplete: true });
+      expect(context.recentMessages.map((message: DiscordChannelMessage) => message.content)).toEqual(['Which proposal?', 'Please review the proposal']);
+      expect(context.referencedMessages.map((message: DiscordChannelMessage) => message.content)).toEqual(['Please review the proposal']);
+      expect(text).not.toContain('PRIVATE_');
+    } finally { await client.close(); }
+  });
+
+  it.each(['lookup failed', 'member unavailable', 'access revoked'])('preserves the origin and exposes no context when %s', async (failure) => {
+    const hidden: DiscordChannelMessage = { id: '66666666666666665', channelId: origin.channelId,
+      authorId: origin.authorId, authorDisplayName: 'Morgan', authorIsBot: false, content: 'PRIVATE_CONTEXT', timestamp: origin.timestamp };
+    const { client } = await connectedClient([READ_SCOPE, CHANNEL_READ_SCOPE], {
+      messenger: { getOriginContext: async () => {
+        if (failure === 'lookup failed') throw new Error('PRIVATE_ERROR');
+        return { recentMessages: [hidden], referencedMessages: [], incomplete: false };
+      } },
+      channelAccess: {
+        isChannelAuthorized: async () => failure !== 'access revoked',
+        isAuthorizedMember: async () => failure === 'member unavailable'
+          ? { status: 'unavailable', reason: 'member_access_request_failed' } : { status: 'authorized' },
+      },
+    });
+    try {
+      const result = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: origin.eventId } });
+      const text = (result.content[0] as { text: string }).text;
+      expect(JSON.parse(text)).toMatchObject({ text: origin.content, context: { status: 'unavailable' } });
+      expect(text).not.toContain('PRIVATE_');
+    } finally { await client.close(); }
+  });
+
+  it('returns no origin or context if the sender loses access during context lookup', async () => {
+    let authorized = true;
+    const { client } = await connectedClient([READ_SCOPE, CHANNEL_READ_SCOPE], {
+      originAuthorized: async () => authorized,
+      messenger: { getOriginContext: async () => {
+        authorized = false;
+        return { recentMessages: [], referencedMessages: [], incomplete: false };
+      } },
+    });
+    try {
+      const result = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: origin.eventId } });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(origin.content);
+    } finally { await client.close(); }
+  });
+
   it('exposes origin read, reply and pending recovery tools, and reads the accepted message', async () => {
     const { client } = await connectedClient([READ_SCOPE, REPLY_SCOPE]);
     try {
@@ -165,6 +237,7 @@ describe('authenticated MCP tools', () => {
 
   it('requires reply scope and never sends when it is absent', async () => {
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),
@@ -188,6 +261,7 @@ describe('authenticated MCP tools', () => {
 
   it('replies only when the stored origin remains authorized', async () => {
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),
@@ -346,6 +420,7 @@ describe('optional channel tools', () => {
       { id: '99999999999999999', channelId: origin.channelId, authorId: '55555555555555555', authorDisplayName: 'Other bot', authorIsBot: true, content: 'PRIVATE_BOT_TEXT', timestamp: origin.timestamp },
     ];
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async (_channelId, _before, _limit, authorizeGuild) => {
@@ -421,6 +496,7 @@ describe('optional channel tools', () => {
       return { status: 'authorized' as const };
     });
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async (_channelId, _before, _limit, authorizeGuild) => {
@@ -447,6 +523,7 @@ describe('optional channel tools', () => {
   it('aborts a channel page when a member grant cannot be checked, without returning content or a cursor', async () => {
     const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async (_channelId, _before, _limit, authorizeGuild) => {
@@ -596,6 +673,7 @@ describe('optional channel tools', () => {
 
   it('returns the recorded send on repeat and never invokes Discord a second time', async () => {
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),
@@ -634,6 +712,7 @@ describe('optional channel tools', () => {
       completeStandaloneMessage: async () => undefined,
     };
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),
@@ -672,6 +751,7 @@ describe('optional channel tools', () => {
 
   it('consents to own-message editing separately from standalone sends', async () => {
     const messenger: DiscordMessenger = {
+      getOriginContext: vi.fn(async () => ({ recentMessages: [], referencedMessages: [], incomplete: false })),
       replyToOrigin: vi.fn(async () => ({ messageId: '77777777777777777' })),
       validateChannelWrite: vi.fn(async () => origin.guildId),
       listChannelMessages: vi.fn(async () => ({ guildId: origin.guildId, messages: [], nextBefore: null })),

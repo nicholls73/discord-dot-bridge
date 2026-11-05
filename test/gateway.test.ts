@@ -91,6 +91,7 @@ describe('Discord Gateway protocol', () => {
       candidate: {
         messageId: '66666666666666666', authorId: '33333333333333333', content: '',
         mentionedUserIds: ['77777777777777777'], mentionedRoleIds: ['44444444444444444'],
+        replyToMessageId: '88888888888888888',
       },
     });
   });

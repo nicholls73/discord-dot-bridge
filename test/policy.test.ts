@@ -4,6 +4,8 @@ import {
   emptyDiscordAuthorization,
   hasDiscordAccess,
   isDiscordAuthorization,
+  isAllowedOrigin,
+  toOriginMessage,
   validateMentionCandidate,
   type DiscordAuthorization,
   type GatewayMentionCandidate,
@@ -31,6 +33,14 @@ function candidate(overrides: Partial<GatewayMentionCandidate> = {}): GatewayMen
 }
 
 describe('runtime Discord authorization policy', () => {
+  it('requires a valid verified bot reply target for an unmentioned origin', () => {
+    const origin = toOriginMessage(candidate({ mentionedUserIds: [] }));
+    expect(isAllowedOrigin({ ...origin, botReply: { messageId: undefined as unknown as string, text: 'Forged' } }, BOT)).toBe(false);
+    expect(isAllowedOrigin({ ...origin, replyToMessageId: '77777777777777777',
+      botReply: { messageId: '77777777777777777', text: 'Which proposal?' } }, BOT)).toBe(true);
+    expect(isAllowedOrigin({ ...origin, replyToMessageId: '77777777777777777',
+      botReply: { messageId: '88888888888888888', text: 'Other reply' } }, BOT)).toBe(false);
+  });
   it('starts empty and denies every new server and member', () => {
     expect(emptyDiscordAuthorization()).toEqual({ guilds: {} });
     expect(hasDiscordAccess(emptyDiscordAuthorization(), GUILD, NICK, [ROLE])).toBe(false);

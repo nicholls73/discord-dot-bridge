@@ -25,6 +25,7 @@ import {
 } from './origin-store.js';
 import {
   applyAuthorizationMutation,
+  discordReplyMessageId,
   emptyDiscordAuthorization,
   hasDiscordAccess,
   isAllowedOrigin,
@@ -162,11 +163,11 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
 
   async recordOriginOnce(origin: OriginMessage): Promise<'accepted' | 'duplicate' | 'rejected'> {
     if (origin.eventId !== origin.messageId || validateMessageCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null) return 'rejected';
-    // Thread context is derived from Discord, never accepted from the caller.
-    const { thread: _thread, ...incoming } = origin;
+    // Conversation triggers are verified with Discord, never accepted from the caller.
+    const { thread: _thread, botReply: _botReply, ...incoming } = origin;
     origin = incoming;
     if (validateMentionCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null &&
-        this.nonThreadChannels.has(origin.channelId)) return 'rejected';
+        !origin.replyToMessageId && this.nonThreadChannels.has(origin.channelId)) return 'rejected';
     const config = await this.getDiscordAuthorization();
     if (!config.guilds[origin.guildId]) return 'rejected';
     const member = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
@@ -179,7 +180,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const content = await this.readBotRoleMention(origin);
       if (content !== null) origin = { ...origin, content };
       else {
-        const followUp = await this.readBotThreadReply(origin);
+        const followUp = await this.readBotReply(origin) ?? await this.readBotThreadReply(origin);
         if (!followUp) return 'rejected';
         origin = { ...origin, ...followUp };
       }
@@ -1025,7 +1026,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     return response.json();
   }
 
-  private async readIncomingMessage(origin: OriginMessage): Promise<{ content: string; mention_roles?: unknown } | null> {
+  private async readIncomingMessage(origin: OriginMessage): Promise<Record<string, any> | null> {
     const message = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${origin.messageId}`);
     if (!message || message.id !== origin.messageId || message.channel_id !== origin.channelId ||
         (message.guild_id !== undefined && message.guild_id !== origin.guildId) ||
@@ -1082,6 +1083,25 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       return { content, thread: {
         parentChannelId: channel.parent_id, starterMessageId: starter.id, starterText: starter.content,
       } };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readBotReply(origin: OriginMessage): Promise<Pick<OriginMessage, 'content' | 'botReply'> | null> {
+    if (!origin.replyToMessageId) return null;
+    try {
+      const channel = await this.readDiscordResource(`/channels/${origin.channelId}`);
+      if (!channel || channel.id !== origin.channelId || channel.guild_id !== origin.guildId ||
+          ![0, 5, 10, 11, 12].includes(channel.type)) return null;
+      const message = await this.readIncomingMessage(origin);
+      if (!message?.content.trim() || discordReplyMessageId(message, origin.guildId, origin.channelId) !== origin.replyToMessageId) return null;
+      const target = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${origin.replyToMessageId}`);
+      if (!target || target.id !== origin.replyToMessageId || target.channel_id !== origin.channelId ||
+          (target.guild_id !== undefined && target.guild_id !== origin.guildId) ||
+          target.author?.id !== this.env.DISCORD_BOT_USER_ID || target.author.bot !== true ||
+          target.webhook_id !== undefined || typeof target.content !== 'string' || target.content.length > 2000) return null;
+      return { content: message.content, botReply: { messageId: target.id, text: target.content } };
     } catch {
       return null;
     }

@@ -20,6 +20,7 @@ export interface GatewayMentionCandidate {
   authorIsBot: boolean;
   mentionedUserIds: string[];
   mentionedRoleIds?: string[];
+  replyToMessageId?: string;
   content: string;
   timestamp: string;
 }
@@ -27,6 +28,7 @@ export interface GatewayMentionCandidate {
 export interface OriginMessage extends GatewayMentionCandidate {
   eventId: string;
   messageUrl: string;
+  botReply?: { messageId: string; text: string };
   thread?: {
     parentChannelId: string;
     starterMessageId: string;
@@ -112,6 +114,8 @@ export function validateMessageCandidate(
     return 'author_not_allowed';
   }
   if (!isDiscordSnowflake(candidate.channelId) || !isDiscordSnowflake(candidate.messageId)) return 'invalid_message_reference';
+  if (candidate.replyToMessageId !== undefined && (typeof candidate.replyToMessageId !== 'string' ||
+      !isDiscordSnowflake(candidate.replyToMessageId) || candidate.replyToMessageId === candidate.messageId)) return 'invalid_message_reference';
   if (!botUserId || !isDiscordSnowflake(botUserId)) return 'bridge_not_configured';
   if (!Array.isArray(candidate.mentionedUserIds) || !isUniqueSnowflakeList(candidate.mentionedUserIds)) return 'invalid_mentions';
   if (candidate.mentionedRoleIds !== undefined && (!Array.isArray(candidate.mentionedRoleIds) ||
@@ -133,6 +137,9 @@ export function validateMentionCandidate(candidate: GatewayMentionCandidate, bot
 export function isAllowedOrigin(origin: OriginMessage, botUserId: string | undefined): boolean {
   if (origin.eventId !== origin.messageId || validateMessageCandidate(origin, botUserId) !== null) return false;
   if (validateMentionCandidate(origin, botUserId) === null) return true;
+  if (origin.botReply && typeof origin.botReply.messageId === 'string' && isDiscordSnowflake(origin.botReply.messageId) &&
+      origin.botReply.messageId === origin.replyToMessageId &&
+      typeof origin.botReply.text === 'string' && origin.botReply.text.length <= 2000 && origin.content.trim()) return true;
   const thread = origin.thread;
   return Boolean(thread && isDiscordSnowflake(thread.parentChannelId) && thread.parentChannelId !== origin.channelId &&
     thread.starterMessageId === origin.channelId && typeof thread.starterText === 'string' &&
@@ -150,6 +157,17 @@ export function toOriginMessage(candidate: GatewayMentionCandidate): OriginMessa
 
 export function isDiscordSnowflake(value: string): boolean {
   return SNOWFLAKE.test(value);
+}
+
+/** Only a same-channel reply reference, never forwarded or quoted message content. */
+export function discordReplyMessageId(message: unknown, guildId: string, channelId: string): string | undefined {
+  if (!isRecord(message) || message.type !== 19 || !isRecord(message.message_reference)) return undefined;
+  const ref = message.message_reference;
+  if ((ref.type !== undefined && ref.type !== 0) ||
+      (ref.guild_id !== undefined && ref.guild_id !== guildId) ||
+      (ref.channel_id !== undefined && ref.channel_id !== channelId) ||
+      typeof ref.message_id !== 'string' || !isDiscordSnowflake(ref.message_id) || ref.message_id === message.id) return undefined;
+  return ref.message_id;
 }
 
 function isUniqueSnowflakeList(value: unknown[]): value is string[] {

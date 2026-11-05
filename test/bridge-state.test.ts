@@ -480,7 +480,7 @@ describe('BridgeState Durable Object outbox', () => {
     expect(storage.alarm).toBeNull();
   });
 
-  it.each(['user', 'managed role', 'thread follow-up'])('carries a %s through durable MCP Events delivery and a reply to the same origin', async (mentionKind) => {
+  it.each(['user', 'managed role', 'thread follow-up', 'direct reply'])('carries a %s through durable MCP Events delivery and a reply to the same origin', async (mentionKind) => {
     class MockGatewaySocket {
       readyState = 1;
       sent: string[] = [];
@@ -510,7 +510,7 @@ describe('BridgeState Durable Object outbox', () => {
       content: mentionKind === 'thread follow-up' ? 'Please summarise that checklist.' : `${mention} please review the synthetic example checklist`,
       author: { id: candidate.authorId, username: 'Synthetic user', bot: false },
       member: { nick: 'Synthetic user' },
-      mentions: mentionKind === 'thread follow-up' ? []
+      mentions: ['thread follow-up', 'direct reply'].includes(mentionKind) ? []
         : [{ id: '88888888888888888' }, ...(mentionKind === 'user' ? [{ id: env.DISCORD_BOT_USER_ID }] : [])],
       mention_roles: mentionKind === 'managed role' ? [ROLE] : [],
       message_reference: { message_id: '99999999999999999', channel_id: candidate.channelId },
@@ -523,6 +523,10 @@ describe('BridgeState Durable Object outbox', () => {
         return Response.json([{ id: ROLE, managed: true, tags: { bot_id: env.DISCORD_BOT_USER_ID } }]);
       }
       if (url.endsWith(`/channels/${candidate.channelId}/messages/${candidate.messageId}`)) return Response.json(message);
+      if (url.endsWith(`/channels/${candidate.channelId}/messages/99999999999999999`)) return Response.json({
+        id: '99999999999999999', channel_id: candidate.channelId,
+        author: { id: env.DISCORD_BOT_USER_ID, bot: true }, content: 'Which checklist should I review?',
+      });
       if (url.endsWith(`/channels/${candidate.channelId}`)) return Response.json({
         id: candidate.channelId, guild_id: candidate.guildId, type: 11, parent_id: '77777777777777777',
       });
@@ -655,6 +659,9 @@ describe('BridgeState Durable Object outbox', () => {
         parentChannelId: '77777777777777777', starterMessageId: candidate.channelId,
         starterText: 'Which checklist should I review?',
       });
+      if (mentionKind === 'direct reply') expect(readOrigin.botReply).toEqual({
+        messageId: '99999999999999999', text: 'Which checklist should I review?',
+      });
       const result = await client.callTool({
         name: 'discord_reply_to_origin',
         arguments: { eventId: '66666666666666666', text: 'Reviewed the checklist.' },
@@ -754,6 +761,54 @@ describe('BridgeState bot thread follow-ups', () => {
       parentChannelId: parentId, starterMessageId: candidate.channelId, starterText: starter.content,
     } };
     await expect(bridge.recordMention(forged)).resolves.toMatchObject({ status: 'rejected' });
+    expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
+  });
+
+  it('accepts a verified Reply to Dot without a ping, even in a cached ordinary channel', async () => {
+    const { bridge, discordFetch } = await setup({ channel: { ...channel, type: 0 } });
+    await expect(bridge.recordMention(followUp)).resolves.toMatchObject({ status: 'rejected' });
+    const read = discordFetch.getMockImplementation()!;
+    discordFetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/messages/${candidate.messageId}`)) return Response.json({
+        ...message, type: 19, message_reference: { message_id: parentId, channel_id: candidate.channelId },
+      });
+      if (String(input).endsWith(`/messages/${parentId}`)) return Response.json({
+        ...starter, id: parentId, channel_id: candidate.channelId,
+      });
+      return read(input, init);
+    });
+    const reply = { ...followUp, replyToMessageId: parentId };
+    await expect(bridge.recordMention(reply)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.getOrigin(candidate.messageId)).resolves.toMatchObject({
+      content: message.content, channelId: candidate.channelId,
+      botReply: { messageId: parentId, text: starter.content },
+    });
+    await expect(bridge.recordMention(reply)).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
+  it.each(['human', 'other bot', 'webhook', 'wrong channel', 'wrong guild', 'forward', 'forged reference', 'empty', 'revoked'])('rejects a %s direct reply trigger', async (failure) => {
+    const { bridge, discordFetch, storage } = await setup({ channel: {
+      ...channel, type: 0, guild_id: failure === 'wrong guild' ? parentId : candidate.guildId,
+    } });
+    const read = discordFetch.getMockImplementation()!;
+    discordFetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith(`/messages/${candidate.messageId}`)) return Response.json({
+        ...message, type: 19, content: failure === 'empty' ? '' : message.content,
+        message_reference: { type: failure === 'forward' ? 1 : 0,
+          message_id: failure === 'forged reference' ? candidate.channelId : parentId, channel_id: candidate.channelId },
+      });
+      if (String(input).endsWith(`/messages/${parentId}`)) {
+        if (failure === 'revoked') await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+        return Response.json({ ...starter, id: parentId,
+          channel_id: failure === 'wrong channel' ? parentId : candidate.channelId,
+          author: failure === 'human' ? { id: candidate.authorId } : failure === 'other bot' ? { id: parentId, bot: true } : starter.author,
+          ...(failure === 'webhook' ? { webhook_id: parentId } : {}),
+        });
+      }
+      return read(input, init);
+    });
+    await expect(bridge.recordMention({ ...followUp, replyToMessageId: parentId,
+      botReply: { messageId: parentId, text: 'Forged' } } as GatewayMentionCandidate)).resolves.toMatchObject({ status: 'rejected' });
     expect((await storage.list({ prefix: 'origin:' })).size).toBe(0);
   });
 

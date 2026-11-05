@@ -3,7 +3,7 @@ import type { EventAuthorizationReference } from './events.js';
 import type { GatewayMentionCandidate, OriginMessage } from './policy.js';
 
 export interface OriginStore {
-  /** Verify the sender and mention or bot-thread trigger before persisting. */
+  /** Verify the sender and mention, bot-reply or bot-thread trigger before persisting. */
   recordOriginOnce(origin: OriginMessage): Promise<'accepted' | 'duplicate' | 'rejected'>;
   getOrigin(eventId: string): Promise<OriginMessage | null>;
   isOriginAuthorized(origin: OriginMessage): Promise<boolean>;
