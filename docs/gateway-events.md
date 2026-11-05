@@ -4,8 +4,8 @@ After completing the [deployment guide](deployment.md), configure Discord permis
 
 ## Discord permissions
 
-1. Install your own Discord bot only into servers you intend to approve. Give it access only to channels where approved members may mention it. Mention replies need `VIEW_CHANNEL` and `SEND_MESSAGES`. Optional message-history reads also need `READ_MESSAGE_HISTORY`; standalone sends and own-message edits need all three permissions. The admin invite link requests these minimum permissions, but channel-specific overwrites can still deny them.
-2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so direct mention handling does not require that intent. HTTP reads of other message content require Message Content access for the Discord application in the Developer Portal. This changes no Gateway identify intent. The service does not automatically respond to unmentioned channel traffic. The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
+1. Install your own Discord bot only into servers you intend to approve. Give it access only to channels where approved members may mention it. Mention replies need `VIEW_CHANNEL` and `SEND_MESSAGES`; replies inside threads use `SEND_MESSAGES_IN_THREADS`. Message lookups also need `READ_MESSAGE_HISTORY`; standalone sends and own-message edits need the channel permissions and history access. The admin invite link requests these permissions, but channel-specific overwrites can still deny them.
+2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so direct mention handling does not require that intent. HTTP reads of other message content require Message Content access for the Discord application in the Developer Portal. This changes no Gateway identify intent. Unmentioned traffic only triggers a response to [direct replies and threads started from the bot's messages](#follow-ups-in-threads-started-from-the-bot). The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
 3. Configure credentials through the [deployment guide](deployment.md). Server, user and role grants are managed at runtime, not through deployment variables.
 
 ## Connect the dot
@@ -57,16 +57,70 @@ do not trigger it.
 Role mentions may arrive without Gateway content. Only when that content is
 empty does the bridge retrieve the incoming message through REST, check its ID,
 channel, author, timestamp and role mention, and retain it as the reply
-destination. It ignores the referenced message and does not scan channel history.
+destination. Quoted mentions cannot enable the trigger; [conversation context](#conversation-context)
+is read separately when authorised.
 This fallback requires the application's
 existing Message Content access and the bot's `VIEW_CHANNEL` and
 `READ_MESSAGE_HISTORY` permissions. It does not enable an intent or change any
 permissions. If REST content is unavailable, use the bot-account mention;
 the bridge fails closed instead of delivering a blank role mention.
 
+## Follow-ups in threads started from the bot
+
+Approved members can continue a public or announcement thread started from the
+bot's own message without repeating its mention. The bridge verifies the
+thread's server and parent channel, then reads the starter message from that
+parent and checks that this bot authored it. Discord assigns the thread the
+same ID as its source message; a thread name, quoted mention, or caller-supplied
+context cannot enable this trigger. See [Discord threads](https://docs.discord.com/developers/topics/threads).
+
+When Gateway content is empty, the bridge reads only the incoming thread
+message through REST and verifies its identity, author and timestamp. This uses
+the application's existing Message Content access; no Gateway intent or live
+permission is changed. Missing, denied or empty content produces no wake. Use a
+direct bot-account mention when that access is unavailable.
+
+These follow-ups use the existing `discord.message.mentioned` subscription,
+typing, recovery and once-only reply flow. The origin read includes the bot's
+starter text as untrusted context, and the reply targets the incoming message
+inside the thread. Current server/member grants are checked before content
+lookups, again before acceptance, and during delivery, reads and replies.
+Discord's Reply action on a bot-authored message also triggers a response without
+a ping, including outside those threads. The bridge verifies the channel's
+server, the incoming message's actual reply reference, and the target bot author
+through REST. A forwarded message or a reply to another person does not enable
+this trigger. The origin includes that bot message as `botReply` context.
+
+Plain messages in ordinary channels, threads rooted in someone else's message,
+and private threads still require an explicit mention or Reply to the bot.
+Private threads also require Discord to give the bot access to that thread.
+
+## Conversation context
+
+With existing, separately consented `discord:channel:read` access,
+`discord_get_origin_message` automatically includes a bounded recent conversation
+and reply chain. In a public or announcement thread it also follows the starter
+back into the parent channel, so a follow-up can refer to the original request.
+The [tool implementation](../src/mcp.ts) owns the bounds and result fields. The
+standalone history tool's supported channel types are unchanged.
+
+Context reads require current linked-owner access to the approved server and
+the bot's view/history permissions. They return only this bot's messages and
+messages by currently granted human members. Cross-channel reply references,
+forwarded content, DMs and private-thread history are excluded. Context is fetched
+on demand, not stored with the origin or included in event notifications.
+
+Without that optional scope the origin remains readable and reports
+`requires_channel_read_scope`; existing grants are never widened. Failed context
+or membership checks return `unavailable` without context text. Deleted messages
+and bounded history can produce incomplete context. Empty text alone cannot
+distinguish an attachment-only message from unavailable Message Content access.
+Use the supplied context before asking someone to repeat their request, and
+state any relevant gap rather than guessing.
+
 ## Native typing while the dot handles a mention
 
-An accepted direct mention starts the bot's native Discord typing indicator promptly, after the bridge verifies a live authorized subscription that received that mention and the sender's current access. It uses the existing bot token and the same dot's event/reply flow. It creates no thinking messages, new tools, subscriptions, AI runtime, or credentials. Mentions without an eligible recipient do not trigger typing; historical origins are not backfilled.
+An accepted mention or bot-thread follow-up starts the bot's native Discord typing indicator promptly, after the bridge verifies a live authorized subscription that received that message and the sender's current access. It uses the existing bot token and the same dot's event/reply flow. It creates no thinking messages, new tools, subscriptions, AI runtime, or credentials. Messages without an eligible recipient do not trigger typing; historical origins are not backfilled.
 
 Discord's [typing endpoint](https://docs.discord.com/developers/resources/channel#trigger-typing-indicator) expires each indicator after ten seconds. The bridge targets one refresh every seven seconds per channel, sharing that schedule among overlapping mentions. A reply ends only its own pending indicator work; other mentions in that channel keep it active. Refreshes continue during the reply send and stop after the MCP reply attempt finishes, whether confirmed, failed, or uncertain. Typing failure never prevents the reply. An uncertain send retains the existing `reply_started` reservation and is never retried by typing work.
 
@@ -98,9 +152,9 @@ Run this only after deployment, owner setup, and approval of a controlled server
 
 1. In the connected dot, subscribe to `discord.message.mentioned`. Confirm the signed callback challenge succeeds and `events/subscribe` returns a subscription ID.
 2. In an approved channel, have a currently granted user or member of a granted role post a short canary that directly mentions the bot. Confirm native typing appears while the same connected dot handles the event, then stops after it replies to the original message.
-3. Confirm the reply stays in the originating channel and references the original message. The MCP tool accepts only an event ID; the server resolves the guild, channel, and message ID from its saved origin.
+3. Confirm the reply stays in the originating channel and references the original message. Use Discord's Reply on it with the ping disabled; confirm Dot responds once. Start a public thread from the bot's reply and post a plain follow-up; confirm the next reply stays inside that thread. With channel-read consent, verify the origin read includes earlier clarifications and the original parent-channel request. The MCP tool accepts only an event ID; the server resolves the destination from its saved origin.
 4. Revoke the tested user or role in `/admin`. Confirm a new mention from that sender is rejected and any stored or queued event from them cannot be read, delivered, or replied to. This UI can grant the linked owner account or members of an explicitly selected role; it preserves and can revoke both grant types. Restore only the grant needed for the remaining canary checks.
-5. Verify negative cases: an unapproved server, a member with neither a direct user grant nor a granted current role, a message without a direct bot mention, a bot-authored message, and a DM produce no event and no reply.
+5. Verify negative cases: an unapproved server, an ungranted member, a plain message in an ordinary channel or a thread started from a human's message, a reply to another human, a bot-authored message, and a DM produce no event and no reply.
 6. Unsubscribe and confirm the Gateway stops when no active event subscriptions remain.
 
 MCP Events uses a persistent webhook subscription on the authenticated `/mcp` endpoint. Callback URLs must be HTTPS, public, and use port 443. The server verifies a fresh challenge, signs event requests with Standard Webhooks HMAC, and retries transient delivery failures with bounded backoff. It does not follow redirects; `410` and `413` responses are terminal. See the [MCP Events specification](https://developers.openai.com/plugins/build/mcp-events).

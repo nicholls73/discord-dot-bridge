@@ -326,7 +326,7 @@ export function retryDelayMs(attempt: number): number {
 
 export const mentionEventDefinition = {
   name: MENTION_EVENT_NAME,
-  description: 'An authorized member mentioned the Discord dot in an approved server channel.',
+  description: 'An authorized member mentioned the Discord dot or continued a public thread started from its message in an approved server.',
   delivery: ['webhook'],
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   payloadSchema: {

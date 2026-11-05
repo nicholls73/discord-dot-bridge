@@ -25,10 +25,14 @@ import {
 } from './origin-store.js';
 import {
   applyAuthorizationMutation,
+  discordReplyMessageId,
   emptyDiscordAuthorization,
   hasDiscordAccess,
   isAllowedOrigin,
   isDiscordAuthorization,
+  isDiscordSnowflake,
+  validateMessageCandidate,
+  validateMentionCandidate,
   type AuthorizationMutation,
   type DiscordAuthorization,
   type GatewayMentionCandidate,
@@ -114,6 +118,7 @@ export interface BridgeStateRuntime {
 
 /** Owns the single Discord Gateway session, validated origins, and durable event outbox. */
 export class BridgeStateDO extends DurableObject<Env> implements OriginStore, MentionRecoveryStore, ChannelAccessStore, StandaloneMessageStore {
+  private readonly nonThreadChannels = new Set<string>();
   private typingWork: Promise<void> | null = null;
   private gatewaySocket: WebSocket | null = null;
   private gatewayProtocol: DiscordGatewayProtocol | null = null;
@@ -157,7 +162,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   }
 
   async recordOriginOnce(origin: OriginMessage): Promise<'accepted' | 'duplicate' | 'rejected'> {
-    if (!isAllowedOrigin(origin, this.env.DISCORD_BOT_USER_ID)) return 'rejected';
+    if (origin.eventId !== origin.messageId || validateMessageCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null) return 'rejected';
+    // Conversation triggers are verified with Discord, never accepted from the caller.
+    const { thread: _thread, botReply: _botReply, ...incoming } = origin;
+    origin = incoming;
+    if (validateMentionCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null &&
+        !origin.replyToMessageId && this.nonThreadChannels.has(origin.channelId)) return 'rejected';
     const config = await this.getDiscordAuthorization();
     if (!config.guilds[origin.guildId]) return 'rejected';
     const member = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
@@ -168,12 +178,16 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     let roleIds = member.roleIds;
     if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
       const content = await this.readBotRoleMention(origin);
-      if (content === null) return 'rejected';
-      // The role/message lookup may outlive the sender's Discord access.
+      if (content !== null) origin = { ...origin, content };
+      else {
+        const followUp = await this.readBotReply(origin) ?? await this.readBotThreadReply(origin);
+        if (!followUp) return 'rejected';
+        origin = { ...origin, ...followUp };
+      }
+      // Discord lookups may outlive the sender's access.
       const refreshedMember = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
       if (refreshedMember.status !== 'member') return 'rejected';
       roleIds = refreshedMember.roleIds;
-      origin = { ...origin, content };
     }
 
     const originKey = `origin:${origin.eventId}`;
@@ -1001,19 +1015,31 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       : 'revoked';
   }
 
-  private async readBotRoleMention(origin: OriginMessage): Promise<string | null> {
+  private async readDiscordResource(path: string): Promise<any> {
     const token = this.env.DISCORD_BOT_TOKEN?.trim();
-    if (!token) return null;
-    const read = async (path: string) => {
-      const response = await fetchWithoutRedirect(this.discordFetch, `https://discord.com/api/v10${path}`, {
-        method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(10_000),
-        headers: { authorization: `Bot ${token}`, accept: 'application/json' },
-      });
-      if (!response.ok) throw new Error('Discord mention lookup failed.');
-      return response.json() as Promise<any>;
-    };
+    if (!token) throw new Error('Discord is not configured.');
+    const response = await fetchWithoutRedirect(this.discordFetch, `https://discord.com/api/v10${path}`, {
+      method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(10_000),
+      headers: { authorization: `Bot ${token}`, accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error('Discord message lookup failed.');
+    return response.json();
+  }
+
+  private async readIncomingMessage(origin: OriginMessage): Promise<Record<string, any> | null> {
+    const message = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${origin.messageId}`);
+    if (!message || message.id !== origin.messageId || message.channel_id !== origin.channelId ||
+        (message.guild_id !== undefined && message.guild_id !== origin.guildId) ||
+        message.author?.id !== origin.authorId || message.author.bot === true || message.webhook_id !== undefined ||
+        typeof message.timestamp !== 'string' || Date.parse(message.timestamp) !== Date.parse(origin.timestamp) ||
+        typeof message.content !== 'string' || message.content.length > 2000) return null;
+    return message;
+  }
+
+  private async readBotRoleMention(origin: OriginMessage): Promise<string | null> {
+    if (!origin.mentionedRoleIds?.length) return null;
     try {
-      const roles = await read(`/guilds/${origin.guildId}/roles`);
+      const roles = await this.readDiscordResource(`/guilds/${origin.guildId}/roles`);
       if (!Array.isArray(roles)) return null;
       const role = roles.find((value) => value?.managed === true &&
         value.tags?.bot_id === this.env.DISCORD_BOT_USER_ID && origin.mentionedRoleIds?.includes(value.id));
@@ -1022,15 +1048,60 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         return origin.content.includes(`<@&${role.id}>`) ? origin.content : null;
       }
       // Role pings can lack Gateway content; REST uses the app's existing content access.
-      const message = await read(`/channels/${origin.channelId}/messages/${origin.messageId}`);
-      if (!message || message.id !== origin.messageId || message.channel_id !== origin.channelId ||
-          (message.guild_id !== undefined && message.guild_id !== origin.guildId) ||
-          message.author?.id !== origin.authorId || message.author.bot === true || message.webhook_id !== undefined ||
-          typeof message.timestamp !== 'string' || Date.parse(message.timestamp) !== Date.parse(origin.timestamp) ||
+      const message = await this.readIncomingMessage(origin);
+      if (!message ||
           !Array.isArray(message.mention_roles) || !message.mention_roles.includes(role.id) ||
-          typeof message.content !== 'string' || message.content.length > 2000 ||
           !message.content.includes(`<@&${role.id}>`)) return null;
       return message.content;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readBotThreadReply(origin: OriginMessage): Promise<Pick<OriginMessage, 'content' | 'thread'> | null> {
+    try {
+      const channel = await this.readDiscordResource(`/channels/${origin.channelId}`);
+      if (!channel || channel.id !== origin.channelId || channel.guild_id !== origin.guildId) return null;
+      if (![10, 11].includes(channel.type)) {
+        // Channel IDs cannot become thread IDs; bound this rejection-only cache.
+        if (Number.isInteger(channel.type)) {
+          if (this.nonThreadChannels.size >= 1_000) this.nonThreadChannels.clear();
+          this.nonThreadChannels.add(origin.channelId);
+        }
+        return null;
+      }
+      if (typeof channel.parent_id !== 'string' ||
+          !isDiscordSnowflake(channel.parent_id) || channel.parent_id === origin.channelId) return null;
+      // A public thread shares its ID with the source message in its parent channel.
+      const starter = await this.readDiscordResource(`/channels/${channel.parent_id}/messages/${origin.channelId}`);
+      if (!starter || starter.id !== origin.channelId || starter.channel_id !== channel.parent_id ||
+          (starter.guild_id !== undefined && starter.guild_id !== origin.guildId) ||
+          starter.author?.id !== this.env.DISCORD_BOT_USER_ID || starter.author.bot !== true ||
+          starter.webhook_id !== undefined || typeof starter.content !== 'string' || starter.content.length > 2000) return null;
+      const content = origin.content || (await this.readIncomingMessage(origin))?.content;
+      if (!content?.trim()) return null;
+      return { content, thread: {
+        parentChannelId: channel.parent_id, starterMessageId: starter.id, starterText: starter.content,
+      } };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readBotReply(origin: OriginMessage): Promise<Pick<OriginMessage, 'content' | 'botReply'> | null> {
+    if (!origin.replyToMessageId) return null;
+    try {
+      const channel = await this.readDiscordResource(`/channels/${origin.channelId}`);
+      if (!channel || channel.id !== origin.channelId || channel.guild_id !== origin.guildId ||
+          ![0, 5, 10, 11, 12].includes(channel.type)) return null;
+      const message = await this.readIncomingMessage(origin);
+      if (!message?.content.trim() || discordReplyMessageId(message, origin.guildId, origin.channelId) !== origin.replyToMessageId) return null;
+      const target = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${origin.replyToMessageId}`);
+      if (!target || target.id !== origin.replyToMessageId || target.channel_id !== origin.channelId ||
+          (target.guild_id !== undefined && target.guild_id !== origin.guildId) ||
+          target.author?.id !== this.env.DISCORD_BOT_USER_ID || target.author.bot !== true ||
+          target.webhook_id !== undefined || typeof target.content !== 'string' || target.content.length > 2000) return null;
+      return { content: message.content, botReply: { messageId: target.id, text: target.content } };
     } catch {
       return null;
     }

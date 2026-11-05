@@ -92,9 +92,9 @@ export async function handleAuthorization(
       const scopeKey = await consentScopeKey(consent.handle);
       await kv.put(scopeKey, JSON.stringify(consentScopes), { expirationTtl: 600 });
       const scopeDescriptions: Record<string, { title: string; description: string }> = {
-        [READ_SCOPE]: { title: 'Read mentions', description: 'Read accepted mentions and the current response policy.' },
-        [REPLY_SCOPE]: { title: 'Reply to mentions', description: 'Reply once to an accepted mention.' },
-        [CHANNEL_READ_SCOPE]: { title: 'Read channel history', description: 'Read message pages from approved channels, limited to the bot and members with current grants.' },
+        [READ_SCOPE]: { title: 'Read conversations with Dot', description: 'Read accepted mentions, replies to the bot, follow-ups in public threads started from its messages, and the current response policy.' },
+        [REPLY_SCOPE]: { title: 'Reply to conversations with Dot', description: 'Reply once to an accepted mention, reply to the bot, or bot-thread follow-up.' },
+        [CHANNEL_READ_SCOPE]: { title: 'Read channel history', description: 'Read approved channel history and conversation context, including public threads and reply chains, limited to the bot and members with current grants.' },
         [MESSAGE_SEND_SCOPE]: { title: 'Send messages', description: 'Send standalone bot messages in approved channels with safe mentions.' },
         [MESSAGE_EDIT_SCOPE]: { title: 'Edit own messages', description: 'Edit only messages authored by this bot in approved channels.' },
         [POLICY_MANAGE_SCOPE]: { title: 'Manage response policy', description: 'Edit and roll back the live response policy.' },

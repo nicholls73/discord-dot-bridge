@@ -1,4 +1,4 @@
-import { isDiscordSnowflake, type OriginMessage } from './policy.js';
+import { discordReplyMessageId, isDiscordSnowflake, type OriginMessage } from './policy.js';
 import { fetchWithoutRedirect, RedirectResponseError } from './fetch-no-redirect.js';
 import { ChannelReadDiagnosticError, type ChannelReadPermission, type ChannelReadStage } from './channel-read-diagnostics.js';
 
@@ -34,11 +34,18 @@ export interface DiscordChannelPage {
   nextBefore: string | null;
 }
 
+export interface DiscordMessageContext {
+  recentMessages: DiscordChannelMessage[];
+  referencedMessages: DiscordChannelMessage[];
+  incomplete: boolean;
+}
+
 export type DiscordNonceReconciliation =
   | { status: 'found'; guildId: string; messageId: string; scannedMessages: number; scanLimit: number }
   | { status: 'not_found'; guildId: string; scannedMessages: number; scanLimit: number; olderHistoryMayContainMessage: boolean };
 
 export interface DiscordMessenger {
+  getOriginContext(origin: OriginMessage, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<DiscordMessageContext>;
   replyToOrigin(origin: OriginMessage, text: string, isAuthorized: () => Promise<boolean>): Promise<{ messageId: string }>;
   validateChannelWrite(channelId: string, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<string>;
   listChannelMessages(
@@ -114,6 +121,66 @@ export class DiscordRestMessenger implements DiscordMessenger {
     if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
     await this.requirePermissions(channel, VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY);
     return channel.guildId;
+  }
+
+  async getOriginContext(origin: OriginMessage, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<DiscordMessageContext> {
+    if (![origin.guildId, origin.channelId, origin.messageId].every(isDiscordSnowflake) ||
+        !await authorizeGuild(origin.guildId)) throw new TypeError('Discord server access is no longer authorized.');
+    const channel = await readJson(await this.request(`${API}/channels/${origin.channelId}`, { method: 'GET' }));
+    if (channel.id !== origin.channelId || channel.guild_id !== origin.guildId || ![0, 5, 10, 11].includes(channel.type)) {
+      throw new TypeError('Conversation context requires a guild text channel or public thread.');
+    }
+    const isThread = [10, 11].includes(channel.type);
+    const permissionChannel = await this.getGuildTextChannel(isThread ? channel.parent_id : origin.channelId);
+    if (permissionChannel.guildId !== origin.guildId || (isThread && permissionChannel.id === origin.channelId)) {
+      throw new TypeError('Discord thread parent could not be verified.');
+    }
+    await this.requirePermissions(permissionChannel, VIEW_CHANNEL | READ_MESSAGE_HISTORY);
+    const context: DiscordMessageContext = { recentMessages: [], referencedMessages: [], incomplete: false };
+    const parse = (raw: any, channelId: string) => {
+      if (raw?.guild_id !== undefined && raw.guild_id !== origin.guildId) throw new TypeError('Discord message guild does not match.');
+      return parseMessage(raw, channelId);
+    };
+    const readMessage = async (channelId: string, messageId: string) => {
+      try {
+        const raw = await readJson(await this.request(`${API}/channels/${channelId}/messages/${messageId}`, { method: 'GET' }));
+        const parsed = parse(raw, channelId);
+        if (parsed.id !== messageId) throw new TypeError('Discord message ID does not match.');
+        return { raw, parsed };
+      } catch (error) {
+        if (!(error instanceof DiscordHttpError) || error.status !== 404) throw error;
+        context.incomplete = true;
+        return null;
+      }
+    };
+    const current = await readMessage(origin.channelId, origin.messageId);
+    if (current && (current.parsed.authorId !== origin.authorId || current.parsed.authorIsBot ||
+        Date.parse(current.parsed.timestamp) !== Date.parse(origin.timestamp))) throw new TypeError('Discord origin does not match.');
+    const query = new URLSearchParams({ limit: '10', before: origin.messageId });
+    const history = await readArray(await this.request(`${API}/channels/${origin.channelId}/messages?${query}`, { method: 'GET' }));
+    if (history.length > 10) throw new TypeError('Discord returned an oversized context page.');
+    context.incomplete ||= history.length === 10;
+    context.recentMessages = history.map((raw) => parse(raw, origin.channelId));
+    if (context.recentMessages.some((message) => BigInt(message.id) >= BigInt(origin.messageId))) {
+      throw new TypeError('Discord returned messages outside the context window.');
+    }
+    context.recentMessages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
+    const seen = new Set([`${origin.channelId}:${origin.messageId}`]);
+    const readChain = async (channelId: string, messageId: string | undefined) => {
+      while (messageId && !seen.has(`${channelId}:${messageId}`)) {
+        if (context.referencedMessages.length >= 5) { context.incomplete = true; break; }
+        seen.add(`${channelId}:${messageId}`);
+        const message = await readMessage(channelId, messageId);
+        if (!message) break;
+        context.referencedMessages.push(message.parsed);
+        messageId = discordReplyMessageId(message.raw, origin.guildId, channelId);
+      }
+    };
+    await readChain(origin.channelId, discordReplyMessageId(current?.raw, origin.guildId, origin.channelId));
+    // Thread starters point into the parent channel even when the new message is a plain follow-up.
+    if (isThread) await readChain(permissionChannel.id, origin.channelId);
+    if (!await authorizeGuild(origin.guildId)) throw new TypeError('Discord server access is no longer authorized.');
+    return context;
   }
 
   async listChannelMessages(

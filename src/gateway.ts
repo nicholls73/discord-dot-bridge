@@ -1,4 +1,4 @@
-import type { GatewayMentionCandidate } from './policy.js';
+import { discordReplyMessageId, type GatewayMentionCandidate } from './policy.js';
 
 export interface GatewaySession {
   sequence: number | null;
@@ -211,7 +211,9 @@ function toMentionCandidate(data: Record<string, unknown>): GatewayMentionCandid
   const authorDisplayName = typeof member?.nick === 'string' ? member.nick
     : typeof author.global_name === 'string' ? author.global_name
       : typeof author.username === 'string' ? author.username : '';
+  const replyToMessageId = discordReplyMessageId(data, data.guild_id, data.channel_id);
   return {
+    ...(replyToMessageId ? { replyToMessageId } : {}),
     guildId: data.guild_id,
     channelId: data.channel_id,
     messageId: data.id,

@@ -37,6 +37,8 @@ rules. They are privacy boundaries, not a bundled response policy.
 - Read the actual event with `discord_get_origin_message`, then reply using
   `discord_reply_to_origin`. Follow the [recovery procedure](gateway-events.md#recovering-a-wake-without-its-payload)
   if the wake lacks its payload. Never guess IDs or resend an uncertain reply.
+  Use the returned [conversation context](gateway-events.md#conversation-context)
+  to resolve follow-ups, while respecting missing-context and access boundaries.
 - Check `policy.configured` and read the current policy before applying response
   guidance. If unconfigured, ask the owner to supply it privately; never invent
   or automatically save one.

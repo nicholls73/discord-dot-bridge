@@ -151,6 +151,119 @@ describe('Discord reply adapter', () => {
   });
 });
 
+describe('Discord conversation context', () => {
+  const parentId = '77777777777777777';
+  const requestId = '44444444444444444';
+  const sourceId = '44444444444444443';
+  const message = (id: string, channel = channelId, content = 'Synthetic discussion') => ({
+    id, channel_id: channel, guild_id: guildId, type: 0, content, timestamp: origin.timestamp,
+    author: { id: origin.authorId, username: 'Morgan', bot: false },
+  });
+  const reference = (id: string, channel = channelId) => ({ message_id: id, channel_id: channel, guild_id: guildId });
+  function setup(thread = false) {
+    const resources = new Map<string, unknown>([
+      [`/channels/${channelId}`, { id: channelId, guild_id: guildId, type: thread ? 11 : 0, parent_id: parentId, permission_overwrites: [] }],
+      [`/channels/${parentId}`, { id: parentId, guild_id: guildId, type: 0, permission_overwrites: [] }],
+      [`/channels/${channelId}/messages/${origin.messageId}`, { ...message(origin.messageId), type: 19,
+        ...(thread ? {} : { message_reference: reference(requestId) }) }],
+      [`/channels/${channelId}/messages`, [message('66666666666666665', channelId, 'Latest clarification'), message('66666666666666664', channelId, 'Earlier follow-up')]],
+      [`/channels/${thread ? parentId : channelId}/messages/${requestId}`, {
+        ...message(requestId, thread ? parentId : channelId, 'Please investigate this'), type: 19,
+        message_reference: reference(sourceId, thread ? parentId : channelId),
+      }],
+      [`/channels/${thread ? parentId : channelId}/messages/${sourceId}`, message(sourceId, thread ? parentId : channelId, 'Review the emailed proposal')],
+      [`/channels/${parentId}/messages/${channelId}`, {
+        ...message(channelId, parentId, 'Which proposal?'), author: { id: botUserId, bot: true }, type: 19,
+        message_reference: reference(requestId, parentId),
+      }],
+    ]);
+    const fallback = discordApiFetch();
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const key = url.pathname.replace('/api/v10', '');
+      if (resources.has(key)) {
+        const value = resources.get(key);
+        return value === null ? new Response(null, { status: 404 }) : Response.json(value);
+      }
+      return fallback(input, init);
+    });
+    return { resources, fetcher, messenger: new DiscordRestMessenger('test-bot-token', fetcher, botUserId) };
+  }
+
+  it.each([false, true])('returns recent context and the original reply chain (thread: %s)', async (thread) => {
+    const { messenger, fetcher } = setup(thread);
+    const context = await messenger.getOriginContext(origin, async () => true);
+    expect(context.recentMessages.map((item) => item.content)).toEqual(['Earlier follow-up', 'Latest clarification']);
+    expect(context.referencedMessages.map((item) => item.content)).toEqual([
+      ...(thread ? ['Which proposal?'] : []), 'Please investigate this', 'Review the emailed proposal',
+    ]);
+    const historyUrl = new URL(String(fetcher.mock.calls.find(([url]) => String(url).includes('/messages?'))![0]));
+    expect(historyUrl.searchParams.get('before')).toBe(origin.messageId);
+    expect(historyUrl.searchParams.get('limit')).toBe('10');
+  });
+
+  it('retains recent context and marks a deleted reference as incomplete', async () => {
+    const { messenger, resources } = setup();
+    resources.set(`/channels/${channelId}/messages/${requestId}`, null);
+    await expect(messenger.getOriginContext(origin, async () => true)).resolves.toMatchObject({
+      recentMessages: [{ content: 'Earlier follow-up' }, { content: 'Latest clarification' }], referencedMessages: [], incomplete: true,
+    });
+  });
+
+  it.each(['channel', 'guild', 'forward'])('does not follow a %s reference outside the reply chain', async (kind) => {
+    const { messenger, resources, fetcher } = setup();
+    resources.set(`/channels/${channelId}/messages/${origin.messageId}`, {
+      ...message(origin.messageId), type: 19, message_reference: {
+        ...reference(requestId), ...(kind === 'channel' ? { channel_id: parentId } : kind === 'guild' ? { guild_id: parentId } : { type: 1 }),
+      },
+    });
+    expect((await messenger.getOriginContext(origin, async () => true)).referencedMessages).toEqual([]);
+    expect(fetcher.mock.calls.some(([url]) => String(url).endsWith(`/messages/${requestId}`))).toBe(false);
+  });
+
+  it.each(['wrong guild', 'private thread', 'DM', 'wrong parent guild', 'wrong message guild', 'wrong author', 'oversized page'])('fails closed for %s', async (kind) => {
+    const { messenger, resources } = setup(true);
+    if (kind === 'wrong guild' || kind === 'private thread' || kind === 'DM') {
+      resources.set(`/channels/${channelId}`, { id: channelId, guild_id: kind === 'wrong guild' ? parentId : guildId,
+        type: kind === 'DM' ? 1 : kind === 'private thread' ? 12 : 11, parent_id: parentId });
+    } else if (kind === 'wrong parent guild') {
+      resources.set(`/channels/${parentId}`, { id: parentId, guild_id: parentId, type: 0, permission_overwrites: [] });
+    } else if (kind === 'oversized page') {
+      resources.set(`/channels/${channelId}/messages`, Array.from({ length: 11 }, () => message(sourceId)));
+    } else {
+      resources.set(`/channels/${channelId}/messages/${origin.messageId}`, {
+        ...message(origin.messageId), ...(kind === 'wrong message guild' ? { guild_id: parentId } : { author: { id: botUserId } }),
+      });
+    }
+    await expect(messenger.getOriginContext(origin, async () => true)).rejects.toThrow();
+  });
+
+  it('performs no Discord reads without current owner/server authorization', async () => {
+    const { messenger, fetcher } = setup();
+    await expect(messenger.getOriginContext(origin, async () => false)).rejects.toThrow();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['long chain', 'cycle'])('bounds a %s instead of following references indefinitely', async (kind) => {
+    const { messenger, resources } = setup();
+    for (let index = 0; index < 7; index++) {
+      const id = (BigInt(requestId) - BigInt(index)).toString();
+      const next = kind === 'cycle' ? requestId : (BigInt(id) - 1n).toString();
+      resources.set(`/channels/${channelId}/messages/${id}`, { ...message(id), type: 19, message_reference: reference(next) });
+    }
+    const result = await messenger.getOriginContext(origin, async () => true);
+    expect(result.referencedMessages).toHaveLength(kind === 'cycle' ? 1 : 5);
+    if (kind === 'long chain') expect(result.incomplete).toBe(true);
+  });
+
+  it('requires the bot to have parent-channel history permissions before reading a thread', async () => {
+    const { messenger, resources, fetcher } = setup(true);
+    resources.set(`/guilds/${guildId}/roles`, [{ id: guildId, permissions: '1024' }]);
+    await expect(messenger.getOriginContext(origin, async () => true)).rejects.toThrow('required channel permissions');
+    expect(fetcher.mock.calls.some(([url]) => String(url).includes('/messages'))).toBe(false);
+  });
+});
+
 describe('Discord channel adapter', () => {
   afterEach(() => vi.useRealTimers());
 
