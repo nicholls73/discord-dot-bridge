@@ -120,13 +120,20 @@ public workflow logs. Variables remain supported for nonconfidential settings.
 | `DISCORD_OAUTH_CLIENT_SECRET` | OAuth client secret for account linking |
 | `TF_STATE_R2_SECRET_ACCESS_KEY` | State secret access key |
 
-The [Deploy workflow](../.github/workflows/deploy.yml) builds the pushed commit
-and verifies a Terraform plan before applying an update. It rejects resource
+The [Deploy workflow](../.github/workflows/deploy.yml) runs automatically on pushes
+to `main`, including PR merges. It builds the pushed commit and verifies a
+Terraform plan before applying an update. It rejects resource
 creation, deletion, storage replacement, bot/endpoint changes and replayed
 bootstrap migrations. First installations still use the local procedure above.
-Require the applicable CI jobs before merging into `main`. Restrict the production
-environment to `main` and require owner approval before enabling deployment.
-Configure all settings first.
+Require the applicable CI jobs before merging into `main` and configure all
+deployment settings first.
+
+In **Settings > Environments > production**, leave **Required reviewers** and
+**Wait timer** disabled so deployments proceed without a manual approval. For an
+existing installation, remove the required-reviewer rule there; it is a GitHub
+environment setting, not part of the workflow. Keep the `production` environment,
+its secrets and its restriction to `main`.
+
 Contributor CI requires no production credentials. Raw plan output stays on the
 runner; if planning fails, diagnose with a private local Terraform plan.
 
