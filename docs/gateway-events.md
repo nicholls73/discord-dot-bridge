@@ -5,7 +5,7 @@ After completing the [deployment guide](deployment.md), configure Discord permis
 ## Discord permissions
 
 1. Install your own Discord bot only into servers you intend to approve. Give it access only to channels where approved members may mention it. Mention replies need `VIEW_CHANNEL` and `SEND_MESSAGES`. Optional message-history reads also need `READ_MESSAGE_HISTORY`; standalone sends and own-message edits need all three permissions. The admin invite link requests these minimum permissions, but channel-specific overwrites can still deny them.
-2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so mention handling does not require that intent. Optional HTTP history reads do require Message Content access to return message bodies: enable the privileged Message Content intent for the Discord application in the Developer Portal. This changes no Gateway identify intent. The service does not automatically respond to unmentioned channel traffic. Role-only mentions remain excluded. The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
+2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so direct mention handling does not require that intent. HTTP reads of other message content require Message Content access for the Discord application in the Developer Portal. This changes no Gateway identify intent. The service does not automatically respond to unmentioned channel traffic. The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
 3. Configure credentials through the [deployment guide](deployment.md). Server, user and role grants are managed at runtime, not through deployment variables.
 
 ## Connect the dot
@@ -44,6 +44,25 @@ The optional `discord:message:send` scope exposes `discord_send_message`; `disco
 Both writing tools accept optional `mentionUserIds` with explicit current authorized human member IDs. When omitted or empty, all mentions are disabled; the adapter never enables role or everyone mentions. If the message text contains other mention syntax, Discord does not notify those users. Recheck the bot's permissions and channel overwrites if a tool reports a permission failure. The OAuth scopes do not grant Discord permissions by themselves; the bot's server install and channel configuration remain separate.
 
 The dot does not start the Gateway connection until an MCP Events subscription exists. One `BridgeStateDO` owns the persistent WebSocket, heartbeat alarms, resume state, accepted origin messages, and durable callback outbox. A subscription is capped at the OAuth token expiry and is removed when that OAuth token record is revoked. Stored origins expire after seven days.
+
+## Bot account and bot role mentions
+
+Discord's mention picker can show both the bot account and a role with the same
+name. Direct bot-account mentions work in normal messages and replies to another
+person. The bot's own managed role also triggers a mention, but only after the
+bridge checks the sender's existing server/member access and verifies Discord's
+`managed` and `tags.bot_id` role metadata. Other roles, namesakes and `@everyone`
+do not trigger it.
+
+Role mentions may arrive without Gateway content. Only when that content is
+empty does the bridge retrieve the incoming message through REST, check its ID,
+channel, author, timestamp and role mention, and retain it as the reply
+destination. It ignores the referenced message and does not scan channel history.
+This fallback requires the application's
+existing Message Content access and the bot's `VIEW_CHANNEL` and
+`READ_MESSAGE_HISTORY` permissions. It does not enable an intent or change any
+permissions. If REST content is unavailable, use the bot-account mention;
+the bridge fails closed instead of delivering a blank role mention.
 
 ## Native typing while the dot handles a mention
 

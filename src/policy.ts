@@ -19,6 +19,7 @@ export interface GatewayMentionCandidate {
   authorDisplayName: string;
   authorIsBot: boolean;
   mentionedUserIds: string[];
+  mentionedRoleIds?: string[];
   content: string;
   timestamp: string;
 }
@@ -107,7 +108,11 @@ export function validateMentionCandidate(
   }
   if (!isDiscordSnowflake(candidate.channelId) || !isDiscordSnowflake(candidate.messageId)) return 'invalid_message_reference';
   if (!botUserId || !isDiscordSnowflake(botUserId)) return 'bridge_not_configured';
-  if (!Array.isArray(candidate.mentionedUserIds) || !candidate.mentionedUserIds.includes(botUserId)) return 'bot_not_mentioned';
+  if (!Array.isArray(candidate.mentionedUserIds)) return 'bot_not_mentioned';
+  // Role candidates must also pass Discord's managed-role check before the origin is stored.
+  if (!candidate.mentionedUserIds.includes(botUserId) &&
+      (!Array.isArray(candidate.mentionedRoleIds) || candidate.mentionedRoleIds.length === 0 ||
+       candidate.mentionedRoleIds.length > 250 || !isUniqueSnowflakeList(candidate.mentionedRoleIds))) return 'bot_not_mentioned';
   if (typeof candidate.content !== 'string' || candidate.content.length > 2000) return 'invalid_content';
   if (typeof candidate.authorDisplayName !== 'string' || candidate.authorDisplayName.length > 128) return 'invalid_author_name';
   if (!Number.isFinite(Date.parse(candidate.timestamp))) return 'invalid_timestamp';

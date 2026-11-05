@@ -217,12 +217,14 @@ function toMentionCandidate(data: Record<string, unknown>): GatewayMentionCandid
     messageId: data.id,
     authorId: author.id,
     authorDisplayName,
-    authorIsBot: author.bot === true,
+    authorIsBot: author.bot === true || typeof data.webhook_id === 'string',
     mentionedUserIds: mentions.flatMap((mention) => {
       if (!mention || typeof mention !== 'object') return [];
       const id = (mention as { id?: unknown }).id;
       return typeof id === 'string' ? [id] : [];
     }),
+    mentionedRoleIds: Array.isArray(data.mention_roles)
+      ? data.mention_roles.filter((id): id is string => typeof id === 'string') : [],
     content: data.content,
     timestamp: data.timestamp,
   };

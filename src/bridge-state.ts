@@ -165,6 +165,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       return 'rejected';
     }
 
+    if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
+      const content = await this.readBotRoleMention(origin);
+      if (content === null) return 'rejected';
+      origin = { ...origin, content };
+    }
+
     const originKey = `origin:${origin.eventId}`;
     const now = this.now();
     const result = await this.ctx.storage.transaction(async (transaction) => {
@@ -988,6 +994,41 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     return hasDiscordAccess(authorization, origin.guildId, origin.authorId, member.roleIds)
       ? 'authorized'
       : 'revoked';
+  }
+
+  private async readBotRoleMention(origin: OriginMessage): Promise<string | null> {
+    const token = this.env.DISCORD_BOT_TOKEN?.trim();
+    if (!token) return null;
+    const read = async (path: string) => {
+      const response = await fetchWithoutRedirect(this.discordFetch, `https://discord.com/api/v10${path}`, {
+        method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(10_000),
+        headers: { authorization: `Bot ${token}`, accept: 'application/json' },
+      });
+      if (!response.ok) throw new Error('Discord mention lookup failed.');
+      return response.json() as Promise<any>;
+    };
+    try {
+      const roles = await read(`/guilds/${origin.guildId}/roles`);
+      if (!Array.isArray(roles)) return null;
+      const role = roles.find((value) => value?.managed === true &&
+        value.tags?.bot_id === this.env.DISCORD_BOT_USER_ID && origin.mentionedRoleIds?.includes(value.id));
+      if (!role) return null;
+      if (origin.content !== '') {
+        return origin.content.includes(`<@&${role.id}>`) ? origin.content : null;
+      }
+      // Role pings can lack Gateway content; REST uses the app's existing content access.
+      const message = await read(`/channels/${origin.channelId}/messages/${origin.messageId}`);
+      if (!message || message.id !== origin.messageId || message.channel_id !== origin.channelId ||
+          (message.guild_id !== undefined && message.guild_id !== origin.guildId) ||
+          message.author?.id !== origin.authorId || message.author.bot === true || message.webhook_id !== undefined ||
+          typeof message.timestamp !== 'string' || Date.parse(message.timestamp) !== Date.parse(origin.timestamp) ||
+          !Array.isArray(message.mention_roles) || !message.mention_roles.includes(role.id) ||
+          typeof message.content !== 'string' || message.content.length > 2000 ||
+          !message.content.includes(`<@&${role.id}>`)) return null;
+      return message.content;
+    } catch {
+      return null;
+    }
   }
 
   private async getCurrentMemberRoles(

@@ -13,8 +13,9 @@ end-to-end mention test after installation.
 
 - Owner-only administration through Cloudflare Access. Approve servers and grant
   members or roles access; new installations allow nobody.
-- Direct-mention delivery, native typing feedback and replies tied to the saved
-  origin. Uncertain sends are not automatically repeated.
+- Bot-account mentions and verified managed bot-role mentions, native typing
+  feedback and replies tied to the saved origin. Redacted role mentions require
+  REST message-content access; uncertain sends are not automatically repeated.
 - Optional, separately consented channel reads, standalone sends and edits to
   the bot's own messages. General channel traffic does not trigger replies.
 - An owner-supplied response policy with revision checks and history. No policy
