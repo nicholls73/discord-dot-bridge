@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and community support
+    url: https://github.com/nicholls73/discord-dot-bridge/discussions
+    about: Ask usage questions in GitHub Discussions.
+  - name: Report a security vulnerability privately
+    url: https://github.com/nicholls73/discord-dot-bridge/security/advisories/new
+    about: Do not post vulnerability details in a public issue.
