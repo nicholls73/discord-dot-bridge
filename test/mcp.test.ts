@@ -411,6 +411,33 @@ describe('optional channel tools', () => {
     } finally { await client.close(); }
   });
 
+  it('reads an explicitly named thread with existing channel-read consent', async () => {
+    const threadId = '88888888888888888';
+    const messages: DiscordChannelMessage[] = [{
+      id: '66666666666666665', channelId: threadId, authorId: origin.authorId,
+      authorDisplayName: 'Synthetic member', authorIsBot: false, content: 'Thread context', timestamp: origin.timestamp,
+    }];
+    const listChannelMessages = vi.fn(async (
+      _targetId: string,
+      _before: string | undefined,
+      _limit: number,
+      authorizeGuild: (guildId: string) => Promise<boolean>,
+    ) => {
+      expect(await authorizeGuild(origin.guildId)).toBe(true);
+      return { guildId: origin.guildId, messages, nextBefore: null };
+    });
+    const { client, messenger } = await connectedClient([READ_SCOPE, CHANNEL_READ_SCOPE], {
+      messenger: { listChannelMessages },
+    });
+    try {
+      const result = await client.callTool({ name: 'discord_list_channel_messages', arguments: { threadId } });
+      const payload = JSON.parse((result.content[0] as { text: string }).text);
+      expect(payload).toMatchObject({ guildId: origin.guildId, threadId, messages: [{ content: 'Thread context' }] });
+      expect(payload).not.toHaveProperty('channelId');
+      expect(messenger.listChannelMessages).toHaveBeenCalledWith(threadId, undefined, 10, expect.any(Function), 'thread');
+    } finally { await client.close(); }
+  });
+
   it('lists the channel tool before opt-in, filters unauthorized authors, and checks duplicate authors once', async () => {
     const messages: DiscordChannelMessage[] = [
       { id: '66666666666666666', channelId: origin.channelId, authorId: '33333333333333333', authorDisplayName: 'Granted human', authorIsBot: false, content: 'Visible request', timestamp: origin.timestamp },
@@ -458,7 +485,7 @@ describe('optional channel tools', () => {
       expect(payload.nextBefore).toBe('99999999999999999');
       expect(raw).not.toContain('PRIVATE_UNAUTHORIZED_TEXT');
       expect(raw).not.toContain('PRIVATE_BOT_TEXT');
-      expect(messenger.listChannelMessages).toHaveBeenCalledWith(origin.channelId, undefined, 5, expect.any(Function));
+      expect(messenger.listChannelMessages).toHaveBeenCalledWith(origin.channelId, undefined, 5, expect.any(Function), 'channel');
       expect(channelAccess.isAuthorizedMember).toHaveBeenCalledTimes(2);
 
       authorGrantActive = false;
@@ -692,12 +719,87 @@ describe('optional channel tools', () => {
       });
       for (let index = 0; index < 2; index++) {
         const result = await call();
-        expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({ status: 'sent', messageId: '77777777777777777' });
+        expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({
+          status: 'sent', messageId: '77777777777777777', destination: { type: 'channel', id: origin.channelId },
+        });
       }
       expect(messenger.sendChannelMessage).toHaveBeenCalledOnce();
       const callArgs = vi.mocked(messenger.sendChannelMessage).mock.calls[0]!;
       expect(callArgs.slice(0, 3)).toEqual([origin.channelId, 'Standalone note', []]);
       expect(callArgs[3]).toHaveLength(24);
+    } finally { await client.close(); }
+  });
+
+  it('sends to an explicitly named thread and preserves the once-only standalone reservation', async () => {
+    const threadId = '88888888888888888';
+    const messenger: Partial<DiscordMessenger> = {
+      validateChannelWrite: vi.fn(async () => origin.guildId),
+      sendChannelMessage: vi.fn(async () => ({ guildId: origin.guildId, messageId: '77777777777777777' })),
+    };
+    const { client } = await connectedClient([READ_SCOPE, MESSAGE_SEND_SCOPE], { messenger });
+    try {
+      const call = () => client.callTool({
+        name: 'discord_send_message',
+        arguments: { threadId, text: 'Reviewed summary', idempotencyKey: 'thread-send-1' },
+      });
+      for (let index = 0; index < 2; index++) {
+        const result = await call();
+        expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({
+          status: 'sent', messageId: '77777777777777777', destination: { type: 'thread', id: threadId },
+        });
+      }
+      expect(messenger.validateChannelWrite).toHaveBeenCalledTimes(2);
+      expect(messenger.validateChannelWrite).toHaveBeenNthCalledWith(1, threadId, expect.any(Function), 'thread');
+      expect(messenger.sendChannelMessage).toHaveBeenCalledOnce();
+      expect(messenger.sendChannelMessage).toHaveBeenCalledWith(
+        threadId, 'Reviewed summary', [], expect.any(String), expect.any(Function), 'thread',
+      );
+
+      const ambiguous = await client.callTool({
+        name: 'discord_send_message',
+        arguments: { channelId: origin.channelId, threadId, text: 'Wrong target shape', idempotencyKey: 'thread-send-2' },
+      });
+      expect(ambiguous.isError).toBe(true);
+      const missing = await client.callTool({
+        name: 'discord_send_message',
+        arguments: { text: 'Missing target', idempotencyKey: 'thread-send-3' },
+      });
+      expect(missing.isError).toBe(true);
+      expect(messenger.sendChannelMessage).toHaveBeenCalledOnce();
+    } finally { await client.close(); }
+  });
+
+  it('reconciles existing channel reservations with the original idempotency hash', async () => {
+    const originalRequest = JSON.stringify({ channelId: origin.channelId, text: 'Existing result', mentionUserIds: [] });
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(originalRequest));
+    const originalHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    const outbound: StandaloneMessageStore = {
+      beginStandaloneMessage: vi.fn(async (_owner, _key, channelId, requestHash) => {
+        expect(channelId).toBe(origin.channelId);
+        expect(requestHash).toBe(originalHash);
+        return { status: 'message_started' as const };
+      }),
+      completeStandaloneMessage: vi.fn(async () => undefined),
+    };
+    const messenger: Partial<DiscordMessenger> = {
+      findOwnMessageByNonce: vi.fn(async () => ({
+        status: 'found' as const, guildId: origin.guildId, messageId: '77777777777777777', scannedMessages: 1, scanLimit: 100,
+      })),
+      sendChannelMessage: vi.fn(),
+    };
+    const { client } = await connectedClient([READ_SCOPE, MESSAGE_SEND_SCOPE], { messenger, outbound });
+    try {
+      const result = await client.callTool({
+        name: 'discord_send_message',
+        arguments: { channelId: origin.channelId, text: 'Existing result', idempotencyKey: 'existing-channel-send' },
+      });
+      expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({
+        status: 'sent', messageId: '77777777777777777', reconciled: true,
+      });
+      expect(messenger.findOwnMessageByNonce).toHaveBeenCalledWith(
+        origin.channelId, expect.any(String), expect.any(Function), 'channel',
+      );
+      expect(messenger.sendChannelMessage).not.toHaveBeenCalled();
     } finally { await client.close(); }
   });
 
@@ -742,7 +844,7 @@ describe('optional channel tools', () => {
           scanLimit: 100,
           olderHistoryMayContainMessage: true,
         },
-        nextStep: expect.stringContaining('Inspect the channel'),
+        nextStep: expect.stringContaining('Inspect the destination'),
       });
       expect(messenger.findOwnMessageByNonce).toHaveBeenCalledOnce();
       expect(messenger.sendChannelMessage).toHaveBeenCalledOnce();
