@@ -526,7 +526,7 @@ describe('Discord channel adapter', () => {
   it.each([
     ['public', 11, 0],
     ['announcement', 10, 5],
-  ])('validates and sends only to the explicitly named %s thread', async (_name, threadType, parentType) => {
+  ])('sends once to the explicitly named archived %s thread', async (_name, threadType, parentType) => {
     const fetchMock = discordThreadApiFetch({ threadType, parentType, archived: true });
     const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
     const authorizeGuild = vi.fn(async (id: string) => id === guildId);
@@ -537,9 +537,10 @@ describe('Discord channel adapter', () => {
     await expect(messenger.findOwnMessageByNonce(threadId, 'stable-nonce', authorizeGuild, 'thread'))
       .resolves.toMatchObject({ status: 'found', guildId, messageId: botMessageId });
 
-    const post = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith(`/channels/${threadId}/messages`) && init?.method === 'POST');
-    expect(post).toBeDefined();
-    expect(JSON.parse(String(post?.[1]?.body))).toMatchObject({ content: 'Thread result', nonce: 'stable-nonce', enforce_nonce: true });
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST');
+    expect(posts).toHaveLength(1);
+    expect(String(posts[0]?.[0])).toContain(`/channels/${threadId}/messages`);
+    expect(JSON.parse(String(posts[0]?.[1]?.body))).toMatchObject({ content: 'Thread result', nonce: 'stable-nonce', enforce_nonce: true });
     expect(authorizeGuild).toHaveBeenCalledWith(guildId);
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/channels/${channelId}/messages`))).toBe(false);
   });
@@ -559,6 +560,7 @@ describe('Discord channel adapter', () => {
     ['wrong parent server', { parentGuildId: '99999999999999999' }],
     ['unsupported parent type', { parentType: 15 }],
     ['locked thread', { locked: true }],
+    ['locked archived thread', { archived: true, locked: true }],
   ])('rejects an unverified or unsupported %s before posting', async (_name, options) => {
     const fetchMock = discordThreadApiFetch(options);
     const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
