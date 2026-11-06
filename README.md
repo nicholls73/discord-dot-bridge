@@ -69,6 +69,12 @@ The bridge enforces access to Discord messages. It cannot isolate your dot's
 broader personal context or prove which conversation caused an MCP call. Review
 the listener guidance and grant only the scopes you need.
 
+## Contributing and security reports
+
+See [contributing guidance](CONTRIBUTING.md) before opening a pull request. Report
+security issues privately using the process in [SECURITY.md](SECURITY.md), not in
+a public issue.
+
 ## Licence
 
 [MIT](LICENSE). The package remains `private` to prevent accidental npm publication;
