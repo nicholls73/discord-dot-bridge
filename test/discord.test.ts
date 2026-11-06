@@ -22,9 +22,11 @@ const fakeResponse = (id: string, status = 200) => new Response(JSON.stringify({
 
 const guildId = origin.guildId;
 const channelId = origin.channelId;
+const threadId = '88888888888888888';
 const botUserId = '22222222222222222';
 const botMessageId = '77777777777777777';
 const requiredPermissions = String((1 << 10) + (1 << 11) + (1 << 16));
+const requiredThreadPermissions = String((1n << 10n) + (1n << 16n) + (1n << 38n));
 
 function discordApiFetch(options: {
   permissions?: string;
@@ -70,6 +72,52 @@ function discordApiFetch(options: {
         author: { id: botUserId, username: 'Dot', bot: true }, content: 'Sent', timestamp: origin.timestamp });
     }
     return new Response(null, { status: 404 });
+  });
+}
+
+function discordThreadApiFetch(options: {
+  threadType?: number;
+  parentType?: number;
+  threadGuildId?: string;
+  parentGuildId?: string;
+  locked?: boolean;
+  archived?: boolean;
+  permissions?: string;
+} = {}) {
+  const fallback = discordApiFetch({ permissions: options.permissions ?? requiredThreadPermissions });
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (url.pathname === `/api/v10/channels/${threadId}`) {
+      return Response.json({
+        id: threadId,
+        guild_id: options.threadGuildId ?? guildId,
+        parent_id: channelId,
+        type: options.threadType ?? 11,
+        thread_metadata: { archived: options.archived ?? false, locked: options.locked ?? false },
+      });
+    }
+    if (url.pathname === `/api/v10/channels/${channelId}`) {
+      return Response.json({
+        id: channelId,
+        guild_id: options.parentGuildId ?? guildId,
+        type: options.parentType ?? 0,
+        permission_overwrites: [],
+      });
+    }
+    if (url.pathname === `/api/v10/channels/${threadId}/messages` && init?.method === 'GET') {
+      return Response.json([{
+        id: botMessageId,
+        channel_id: threadId,
+        author: { id: botUserId, username: 'Dot', bot: true },
+        content: 'Thread reply',
+        timestamp: origin.timestamp,
+        nonce: 'stable-nonce',
+      }]);
+    }
+    if (url.pathname === `/api/v10/channels/${threadId}/messages` && init?.method === 'POST') {
+      return Response.json({ id: botMessageId, channel_id: threadId, author: { id: botUserId, bot: true } });
+    }
+    return fallback(input, init);
   });
 }
 
@@ -473,6 +521,68 @@ describe('Discord channel adapter', () => {
     await explicit.sendChannelMessage(channelId, '<@33333333333333333>', ['33333333333333333'], 'another-nonce', async () => true);
     const explicitPost = explicitFetch.mock.calls.find(([input, init]) => String(input).endsWith('/messages') && init?.method === 'POST');
     expect(JSON.parse(String(explicitPost?.[1]?.body)).allowed_mentions).toEqual({ users: ['33333333333333333'] });
+  });
+
+  it.each([
+    ['public', 11, 0],
+    ['announcement', 10, 5],
+  ])('sends once to the explicitly named archived %s thread', async (_name, threadType, parentType) => {
+    const fetchMock = discordThreadApiFetch({ threadType, parentType, archived: true });
+    const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
+    const authorizeGuild = vi.fn(async (id: string) => id === guildId);
+
+    await expect(messenger.validateChannelWrite(threadId, authorizeGuild, 'thread')).resolves.toBe(guildId);
+    await expect(messenger.sendChannelMessage(threadId, 'Thread result', [], 'stable-nonce', authorizeGuild, 'thread'))
+      .resolves.toEqual({ guildId, messageId: botMessageId });
+    await expect(messenger.findOwnMessageByNonce(threadId, 'stable-nonce', authorizeGuild, 'thread'))
+      .resolves.toMatchObject({ status: 'found', guildId, messageId: botMessageId });
+
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST');
+    expect(posts).toHaveLength(1);
+    expect(String(posts[0]?.[0])).toContain(`/channels/${threadId}/messages`);
+    expect(JSON.parse(String(posts[0]?.[1]?.body))).toMatchObject({ content: 'Thread result', nonce: 'stable-nonce', enforce_nonce: true });
+    expect(authorizeGuild).toHaveBeenCalledWith(guildId);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/channels/${channelId}/messages`))).toBe(false);
+  });
+
+  it('reads a bounded page from the explicitly named thread using its verified parent permissions', async () => {
+    const fetchMock = discordThreadApiFetch();
+    const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
+    const page = await messenger.listChannelMessages(threadId, undefined, 1, async (id) => id === guildId, 'thread');
+    expect(page).toMatchObject({ guildId, messages: [{ channelId: threadId, content: 'Thread reply' }], nextBefore: botMessageId });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/channels/${threadId}/messages?limit=1`))).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes(`/channels/${channelId}/messages?limit=1`))).toBe(false);
+  });
+
+  it.each([
+    ['private thread', { threadType: 12 }],
+    ['channel supplied as a thread', { threadType: 0 }],
+    ['wrong parent server', { parentGuildId: '99999999999999999' }],
+    ['unsupported parent type', { parentType: 15 }],
+    ['locked thread', { locked: true }],
+    ['locked archived thread', { archived: true, locked: true }],
+  ])('rejects an unverified or unsupported %s before posting', async (_name, options) => {
+    const fetchMock = discordThreadApiFetch(options);
+    const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
+    await expect(messenger.sendChannelMessage(threadId, 'Thread result', [], 'stable-nonce', async () => true, 'thread'))
+      .rejects.toThrow();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it('requires SEND_MESSAGES_IN_THREADS even when SEND_MESSAGES is granted on the parent', async () => {
+    const fetchMock = discordThreadApiFetch({ permissions: String((1n << 10n) + (1n << 11n) + (1n << 16n)) });
+    const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
+    await expect(messenger.sendChannelMessage(threadId, 'Thread result', [], 'stable-nonce', async () => true, 'thread'))
+      .rejects.toMatchObject({ missingPermissions: ['SEND_MESSAGES_IN_THREADS'] });
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
+
+  it('does not treat a thread ID as a channel destination', async () => {
+    const fetchMock = discordThreadApiFetch();
+    const messenger = new DiscordRestMessenger('test-bot-token', fetchMock, botUserId);
+    await expect(messenger.sendChannelMessage(threadId, 'Thread result', [], 'stable-nonce', async () => true))
+      .rejects.toThrow('Only guild text and announcement channels are supported');
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
   });
 
   it('reconciles a nonce only when Discord reports the matching bot-authored message', async () => {

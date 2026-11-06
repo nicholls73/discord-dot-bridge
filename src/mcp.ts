@@ -5,7 +5,7 @@ import {
 } from '@cloudflare/workers-oauth-provider';
 import { McpServer, createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
-import { DiscordRestMessenger, type DiscordChannelMessage, type DiscordGuildChannel, type DiscordMessenger } from './discord.js';
+import { DiscordRestMessenger, type DiscordChannelMessage, type DiscordDestinationType, type DiscordGuildChannel, type DiscordMessenger } from './discord.js';
 import type { EventSubscriptionBackend } from './mcp-events.js';
 import { handleEventProtocolRequest, verifyCallback } from './mcp-events.js';
 import type { EventAuthorizationReference } from './events.js';
@@ -222,24 +222,30 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
       });
 
       server.registerTool('discord_list_channel_messages', {
-        description: 'Read one bounded page of recent messages from an approved guild text or announcement channel. Requires separately consented discord:channel:read. The linked Discord owner must be a current approved-server member holding a user or role grant. Results include only your bot messages and current human members who also have an existing user or role grant; other bots and unauthorized members are omitted. If any current membership check is unavailable, the page fails without a cursor so authorized messages are not skipped. Pages contain at most 20 messages; follow nextBefore to read older messages. Threads and DMs are not supported.',
+        description: 'Read one bounded page of recent messages from an approved guild text or announcement channel, or an explicitly named public or announcement thread. Supply exactly one of channelId or threadId. The server verifies the exact target ID, thread type and text/announcement parent; private threads and DMs are not supported. Requires separately consented discord:channel:read. The linked Discord owner must be a current approved-server member holding a user or role grant. Results include only your bot messages and current human members who also have an existing user or role grant; other bots and unauthorized members are omitted. If any current membership check is unavailable, the page fails without a cursor so authorized messages are not skipped. Pages contain at most 20 messages; follow nextBefore to read older messages.',
         inputSchema: z.object({
-          channelId: z.string().regex(/^\d{17,20}$/),
+          channelId: z.string().regex(/^\d{17,20}$/).optional(),
+          threadId: z.string().regex(/^\d{17,20}$/).optional(),
           limit: z.number().int().min(1).max(20).default(10),
           before: z.string().regex(/^\d{17,20}$/).optional(),
-        }).strict(),
+        }).strict().refine(({ channelId, threadId }) => Boolean(channelId) !== Boolean(threadId),
+          'Supply exactly one of channelId or threadId.'),
         annotations: { readOnlyHint: true, idempotentHint: true },
-      }, async ({ channelId, limit, before }) => {
+      }, async ({ channelId, threadId, limit, before }) => {
         if (!hasScope(authInfo, READ_SCOPE) || !hasScope(authInfo, CHANNEL_READ_SCOPE)) {
           return toolError('Explicit discord:channel:read consent is required.');
         }
+        const destinationId = threadId ?? channelId;
+        if (!destinationId) return toolError('Supply exactly one of channelId or threadId.');
+        const destinationType: DiscordDestinationType = threadId ? 'thread' : 'channel';
         let diagnosticStage: ChannelReadStage = 'channel_lookup';
         try {
           const page = await dependencies.discord.listChannelMessages(
-            channelId,
+            destinationId,
             before,
             limit,
             (guildId) => dependencies.channelAccess.isChannelAuthorized(policyOwner(), guildId),
+            destinationType,
           );
           const botUserId = dependencies.env.DISCORD_BOT_USER_ID;
           diagnosticStage = 'member_grant_lookup';
@@ -257,7 +263,7 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
           }
           return { content: [{ type: 'text', text: JSON.stringify({
             guildId: page.guildId,
-            channelId,
+            ...(threadId ? { threadId } : { channelId }),
             messages: messages.filter((message): message is DiscordChannelMessage => message !== null).map(publicChannelMessage),
             nextBefore: page.nextBefore,
           }) }] };
@@ -273,24 +279,31 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
 
     if (ownerToolsAvailable) {
       server.registerTool('discord_send_message', {
-        description: 'Send a standalone message as the bot to an approved guild text or announcement channel. Requires separately consented discord:message:send. Supply a stable idempotencyKey. Retries search only the newest 100 channel messages for the Discord nonce; if no match is found, the result stays unresolved and the bot never posts again automatically. Inspect the channel before creating a new send. Mentions are disabled unless mentionUserIds explicitly names current authorized human members. Role and everyone mentions are never enabled.',
+        description: 'Send a standalone message as the bot to an approved guild text or announcement channel, or an explicitly named public or announcement thread. Supply exactly one of channelId or threadId; the server verifies the exact target ID, thread type, and text/announcement parent. Private and locked threads are not supported. Discord automatically unarchives an unlocked archived thread when creating a message (https://docs.discord.com/developers/resources/channel). Requires separately consented discord:message:send. Supply a stable idempotencyKey. Retries search only the newest 100 destination messages for the Discord nonce; if no match is found, the result stays unresolved and the bot never posts again automatically. Inspect the channel or thread before creating a new send. Mentions are disabled unless mentionUserIds explicitly names current authorized human members. Role and everyone mentions are never enabled.',
         inputSchema: z.object({
-          channelId: z.string().regex(/^\d{17,20}$/),
+          channelId: z.string().regex(/^\d{17,20}$/).optional(),
+          threadId: z.string().regex(/^\d{17,20}$/).optional(),
           text: z.string().trim().min(1).max(2000),
           idempotencyKey: z.string().trim().min(1).max(128),
           mentionUserIds: z.array(z.string().regex(/^\d{17,20}$/)).max(20).default([])
             .refine((ids) => new Set(ids).size === ids.length, 'Mention recipients must be unique.'),
-        }).strict(),
+        }).strict().refine(({ channelId, threadId }) => Boolean(channelId) !== Boolean(threadId),
+          'Supply exactly one of channelId or threadId.'),
         annotations: { readOnlyHint: false, idempotentHint: true },
-      }, async ({ channelId, text, idempotencyKey, mentionUserIds }) => {
+      }, async ({ channelId, threadId, text, idempotencyKey, mentionUserIds }) => {
         if (!hasScope(authInfo, READ_SCOPE) || !hasScope(authInfo, MESSAGE_SEND_SCOPE)) {
           return toolError('Explicit discord:message:send consent is required.');
         }
+        const destinationId = threadId ?? channelId;
+        if (!destinationId) return toolError('Supply exactly one of channelId or threadId.');
+        const destinationType: DiscordDestinationType = threadId ? 'thread' : 'channel';
+        const destination = { type: destinationType, id: destinationId };
         try {
           const owner = policyOwner();
           const guildId = await dependencies.discord.validateChannelWrite(
-            channelId,
+            destinationId,
             (currentGuildId) => dependencies.channelAccess.isChannelAuthorized(owner, currentGuildId),
+            destinationType,
           );
           if (!await dependencies.channelAccess.isChannelAuthorized(owner, guildId)) {
             return toolError('The linked Discord owner does not have an active grant in this approved server.');
@@ -298,44 +311,48 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
           if (!await authorizedMentionRecipients(dependencies.channelAccess, guildId, mentionUserIds)) {
             return toolError('Every explicit mention recipient must be a current human member with an existing user or role grant.');
           }
-          const requestHash = await sha256Hex(JSON.stringify({ channelId, text, mentionUserIds: [...mentionUserIds].sort() }));
-          const nonce = await standaloneNonce(owner, channelId, idempotencyKey);
-          const previous = await dependencies.outbound.beginStandaloneMessage(owner, idempotencyKey, channelId, requestHash, nonce);
+          const request = { channelId: destinationId, text, mentionUserIds: [...mentionUserIds].sort() };
+          const requestHash = await sha256Hex(JSON.stringify(destinationType === 'thread' ? { destinationType, ...request } : request));
+          const nonce = await standaloneNonce(owner, destinationId, idempotencyKey);
+          const previous = await dependencies.outbound.beginStandaloneMessage(owner, idempotencyKey, destinationId, requestHash, nonce);
           if (previous.status === 'sent') {
-            return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: previous.messageId }) }] };
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: previous.messageId, destination }) }] };
           }
           if (previous.status === 'message_started') {
             const reconciliation = await dependencies.discord.findOwnMessageByNonce(
-              channelId,
+              destinationId,
               nonce,
               (currentGuildId) => dependencies.channelAccess.isChannelAuthorized(owner, currentGuildId),
+              destinationType,
             );
             if (reconciliation.status === 'found') {
-              await dependencies.outbound.completeStandaloneMessage(owner, idempotencyKey, channelId, requestHash, reconciliation.messageId);
-              return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: reconciliation.messageId, reconciled: true }) }] };
+              await dependencies.outbound.completeStandaloneMessage(owner, idempotencyKey, destinationId, requestHash, reconciliation.messageId);
+              return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: reconciliation.messageId, destination, reconciled: true }) }] };
             }
             return { content: [{ type: 'text', text: JSON.stringify({
               status: 'message_started',
               messageId: null,
+              destination,
               reconciliation: {
                 status: 'not_found_in_recent_history',
                 scannedMessages: reconciliation.scannedMessages,
                 scanLimit: reconciliation.scanLimit,
                 olderHistoryMayContainMessage: reconciliation.olderHistoryMayContainMessage,
               },
-              nextStep: 'Inspect the channel before creating any new send; this result does not prove the message was not posted.',
+              nextStep: 'Inspect the destination before creating any new send; this result does not prove the message was not posted.',
             }) }] };
           }
           const sent = await dependencies.discord.sendChannelMessage(
-            channelId,
+            destinationId,
             text,
             mentionUserIds,
             nonce,
             async (currentGuildId) => await dependencies.channelAccess.isChannelAuthorized(owner, currentGuildId) &&
               await authorizedMentionRecipients(dependencies.channelAccess, currentGuildId, mentionUserIds),
+            destinationType,
           );
-          await dependencies.outbound.completeStandaloneMessage(owner, idempotencyKey, channelId, requestHash, sent.messageId);
-          return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: sent.messageId }) }] };
+          await dependencies.outbound.completeStandaloneMessage(owner, idempotencyKey, destinationId, requestHash, sent.messageId);
+          return { content: [{ type: 'text', text: JSON.stringify({ status: 'sent', messageId: sent.messageId, destination }) }] };
         } catch {
           return toolError('The send was not confirmed. It may already have been posted; retry only with the same idempotencyKey so the result can be reconciled.');
         }

@@ -6,9 +6,12 @@ const API = 'https://discord.com/api/v10';
 const VIEW_CHANNEL = 1n << 10n;
 const SEND_MESSAGES = 1n << 11n;
 const READ_MESSAGE_HISTORY = 1n << 16n;
+const SEND_MESSAGES_IN_THREADS = 1n << 38n;
 const ADMINISTRATOR = 1n << 3n;
 const PERMISSION_MAX_RETRY_DELAY_MS = 1_000;
 export const NONCE_RECONCILIATION_LIMIT = 100;
+
+export type DiscordDestinationType = 'channel' | 'thread';
 
 export interface DiscordGuildChannel {
   id: string;
@@ -47,17 +50,23 @@ export type DiscordNonceReconciliation =
 export interface DiscordMessenger {
   getOriginContext(origin: OriginMessage, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<DiscordMessageContext>;
   replyToOrigin(origin: OriginMessage, text: string, isAuthorized: () => Promise<boolean>): Promise<{ messageId: string }>;
-  validateChannelWrite(channelId: string, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<string>;
+  validateChannelWrite(
+    channelId: string,
+    authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType?: DiscordDestinationType,
+  ): Promise<string>;
   listChannelMessages(
     channelId: string,
     before: string | undefined,
     limit: number,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType?: DiscordDestinationType,
   ): Promise<DiscordChannelPage>;
   findOwnMessageByNonce(
     channelId: string,
     nonce: string,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType?: DiscordDestinationType,
   ): Promise<DiscordNonceReconciliation>;
   sendChannelMessage(
     channelId: string,
@@ -65,6 +74,7 @@ export interface DiscordMessenger {
     mentionUserIds: string[],
     nonce: string,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType?: DiscordDestinationType,
   ): Promise<{ guildId: string; messageId: string }>;
   editOwnChannelMessage(
     channelId: string,
@@ -116,10 +126,16 @@ export class DiscordRestMessenger implements DiscordMessenger {
     return { messageId: message.id };
   }
 
-  async validateChannelWrite(channelId: string, authorizeGuild: (guildId: string) => Promise<boolean>): Promise<string> {
-    const channel = await this.getGuildTextChannel(channelId);
+  async validateChannelWrite(
+    channelId: string,
+    authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType: DiscordDestinationType = 'channel',
+  ): Promise<string> {
+    const channel = await this.getGuildMessageTarget(channelId, destinationType);
     if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
-    await this.requirePermissions(channel, VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY);
+    if (channel.threadLocked) throw new TypeError('Discord thread is locked.');
+    await this.requirePermissions(channel, VIEW_CHANNEL |
+      (destinationType === 'thread' ? SEND_MESSAGES_IN_THREADS : SEND_MESSAGES) | READ_MESSAGE_HISTORY);
     return channel.guildId;
   }
 
@@ -188,13 +204,14 @@ export class DiscordRestMessenger implements DiscordMessenger {
     before: string | undefined,
     limit: number,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType: DiscordDestinationType = 'channel',
   ): Promise<DiscordChannelPage> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 20 || (before && !isDiscordSnowflake(before))) {
       throw new TypeError('Invalid Discord channel page.');
     }
     let stage: ChannelReadStage = 'channel_lookup';
     try {
-      const channel = await this.getGuildTextChannel(channelId);
+      const channel = await this.getGuildMessageTarget(channelId, destinationType);
       stage = 'server_authorization';
       let authorized: boolean;
       try {
@@ -253,9 +270,10 @@ export class DiscordRestMessenger implements DiscordMessenger {
     channelId: string,
     nonce: string,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType: DiscordDestinationType = 'channel',
   ): Promise<DiscordNonceReconciliation> {
     if (!nonce || nonce.length > 25) throw new TypeError('Invalid Discord message nonce.');
-    const channel = await this.getGuildTextChannel(channelId);
+    const channel = await this.getGuildMessageTarget(channelId, destinationType);
     if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
     await this.requirePermissions(channel, VIEW_CHANNEL | READ_MESSAGE_HISTORY);
     const response = await this.request(`${API}/channels/${channelId}/messages?limit=${NONCE_RECONCILIATION_LIMIT}`, { method: 'GET' });
@@ -288,13 +306,16 @@ export class DiscordRestMessenger implements DiscordMessenger {
     mentionUserIds: string[],
     nonce: string,
     authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType: DiscordDestinationType = 'channel',
   ): Promise<{ guildId: string; messageId: string }> {
     if (!nonce || nonce.length > 25) throw new TypeError('Invalid Discord message nonce.');
     const content = normalizeMessageText(text);
     const mentions = validateMentionUserIds(mentionUserIds);
-    const channel = await this.getGuildTextChannel(channelId);
+    const channel = await this.getGuildMessageTarget(channelId, destinationType);
     if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
-    await this.requirePermissions(channel, VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY);
+    if (channel.threadLocked) throw new TypeError('Discord thread is locked.');
+    await this.requirePermissions(channel, VIEW_CHANNEL |
+      (destinationType === 'thread' ? SEND_MESSAGES_IN_THREADS : SEND_MESSAGES) | READ_MESSAGE_HISTORY);
     const response = await this.request(`${API}/channels/${channelId}/messages`, {
       method: 'POST',
       body: JSON.stringify({
@@ -344,10 +365,37 @@ export class DiscordRestMessenger implements DiscordMessenger {
     return { guildId: channel.guildId, messageId };
   }
 
-  private async getGuildTextChannel(channelId: string): Promise<DiscordChannel> {
+  private async getGuildMessageTarget(
+    channelId: string,
+    destinationType: DiscordDestinationType,
+  ): Promise<DiscordChannel> {
     if (!isDiscordSnowflake(channelId)) throw new TypeError('Invalid Discord channel ID.');
     const response = await this.request(`${API}/channels/${channelId}`, { method: 'GET' });
     const value = await readJson(response);
+    if (value.id !== channelId || !isDiscordSnowflake(value.guild_id)) {
+      throw new TypeError('Discord destination identity could not be verified.');
+    }
+    if (destinationType === 'channel') return this.parseGuildTextChannel(value, channelId);
+    const metadata = value.thread_metadata;
+    if (destinationType !== 'thread' || ![10, 11].includes(value.type) || !isDiscordSnowflake(value.parent_id) ||
+        !metadata || typeof metadata.archived !== 'boolean' || typeof metadata.locked !== 'boolean') {
+      throw new TypeError('Only public or announcement threads are supported as thread destinations.');
+    }
+    const parent = await this.getGuildTextChannel(value.parent_id);
+    if (parent.guildId !== value.guild_id || parent.id === channelId ||
+        (value.type === 10 && parent.type !== 5) || (value.type === 11 && parent.type !== 0)) {
+      throw new TypeError('Discord thread parent could not be verified.');
+    }
+    return { id: channelId, guildId: value.guild_id, type: value.type, overwrites: parent.overwrites, threadLocked: metadata.locked };
+  }
+
+  private async getGuildTextChannel(channelId: string): Promise<DiscordChannel> {
+    if (!isDiscordSnowflake(channelId)) throw new TypeError('Invalid Discord channel ID.');
+    const response = await this.request(`${API}/channels/${channelId}`, { method: 'GET' });
+    return this.parseGuildTextChannel(await readJson(response), channelId);
+  }
+
+  private parseGuildTextChannel(value: any, channelId: string): DiscordChannel {
     if (value.id !== channelId || !isDiscordSnowflake(value.guild_id) || ![0, 5].includes(value.type)) {
       throw new TypeError('Only guild text and announcement channels are supported.');
     }
@@ -357,6 +405,7 @@ export class DiscordRestMessenger implements DiscordMessenger {
     return {
       id: channelId,
       guildId: value.guild_id,
+      type: value.type,
       overwrites: value.permission_overwrites,
     };
   }
@@ -402,6 +451,7 @@ export class DiscordRestMessenger implements DiscordMessenger {
       if ((missing & VIEW_CHANNEL) !== 0n) missingPermissions.push('VIEW_CHANNEL');
       if ((missing & READ_MESSAGE_HISTORY) !== 0n) missingPermissions.push('READ_MESSAGE_HISTORY');
       if ((missing & SEND_MESSAGES) !== 0n) missingPermissions.push('SEND_MESSAGES');
+      if ((missing & SEND_MESSAGES_IN_THREADS) !== 0n) missingPermissions.push('SEND_MESSAGES_IN_THREADS');
       throw new DiscordMissingPermissionsError(missingPermissions);
     }
   }
@@ -438,10 +488,12 @@ export class DiscordRestMessenger implements DiscordMessenger {
 interface DiscordChannel {
   id: string;
   guildId: string;
+  type: number;
   overwrites: unknown[];
+  threadLocked?: boolean;
 }
 
-type DiscordPermissionName = ChannelReadPermission | 'SEND_MESSAGES';
+type DiscordPermissionName = ChannelReadPermission | 'SEND_MESSAGES' | 'SEND_MESSAGES_IN_THREADS';
 
 class DiscordHttpError extends TypeError {
   constructor(readonly status: number, readonly retryAfterMs?: number) {
