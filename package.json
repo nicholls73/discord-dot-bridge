@@ -32,17 +32,17 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20261004.1",
+    "@cloudflare/workers-types": "5.20261104.1",
     "@modelcontextprotocol/client": "2.3.0",
     "@tailwindcss/cli": "4.3.0",
     "@types/node": "26.6.4",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "esbuild": "0.28.1",
-    "miniflare": "5.20261001.0-alpha",
+    "miniflare": "5.20261104.0-beta",
     "tailwindcss": "4.3.0",
     "typescript": "7.0.2",
     "vitest": "5.0.3",
-    "wrangler": "4.147.0"
+    "wrangler": "4.158.0"
   }
 }
