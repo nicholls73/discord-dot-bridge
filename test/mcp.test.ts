@@ -161,6 +161,32 @@ describe('authenticated MCP tools', () => {
     } finally { await client.close(); }
   });
 
+  it.each(['visible', 'denied', 'empty history'])('identifies the actual message immediately above the origin with %s context', async (kind) => {
+    const earlier: DiscordChannelMessage = { id: '66666666666666664', channelId: origin.channelId,
+      authorId: origin.authorId, authorDisplayName: 'Morgan', authorIsBot: false,
+      content: 'Earlier discussion', timestamp: origin.timestamp };
+    const preceding = { ...earlier, id: '66666666666666665', authorId: '77777777777777777', content: 'Uploaded the project scope.', nonce: 'PRIVATE_NONCE' };
+    const { client } = await connectedClient([READ_SCOPE, CHANNEL_READ_SCOPE], {
+      messenger: { getOriginContext: async () => ({ recentMessages: kind === 'empty history' ? [] : [earlier, preceding], referencedMessages: [], incomplete: false }) },
+      channelAccess: { isChannelAuthorized: async () => true,
+        isAuthorizedMember: async (_guild, user) => ({ status: kind === 'denied' && user === preceding.authorId ? 'denied' : 'authorized' }) },
+    });
+    try {
+      const result = await client.callTool({ name: 'discord_get_origin_message', arguments: { eventId: origin.eventId } });
+      const text = (result.content[0] as { text: string }).text;
+      const context = JSON.parse(text).context;
+      expect(context.immediatelyPrecedingMessage).toEqual(kind === 'visible' ? {
+        ...earlier, id: '66666666666666665', authorId: '77777777777777777', content: 'Uploaded the project scope.',
+        messageUrl: 'https://discord.com/channels/11111111111111111/55555555555555555/66666666666666665',
+      } : null);
+      expect(text).not.toContain('PRIVATE_NONCE');
+      if (kind === 'denied') {
+        expect(context.recentMessages.map((message: DiscordChannelMessage) => message.id)).toEqual([earlier.id]);
+        expect(text).not.toContain(preceding.content);
+      }
+    } finally { await client.close(); }
+  });
+
   it.each(['lookup failed', 'member unavailable', 'access revoked'])('preserves the origin and exposes no context when %s', async (failure) => {
     const hidden: DiscordChannelMessage = { id: '66666666666666665', channelId: origin.channelId,
       authorId: origin.authorId, authorDisplayName: 'Morgan', authorIsBot: false, content: 'PRIVATE_CONTEXT', timestamp: origin.timestamp };
@@ -290,7 +316,7 @@ describe('authenticated MCP tools', () => {
     try {
       const { tools } = await client.listTools();
       const reply = tools.find((tool) => tool.name === 'discord_reply_to_origin');
-      expect(Object.keys(reply?.inputSchema.properties ?? {}).sort()).toEqual(['eventId', 'text']);
+      expect(Object.keys(reply?.inputSchema.properties ?? {}).sort()).toEqual(['eventId', 'expectsResponse', 'text']);
     } finally {
       await client.close();
     }
