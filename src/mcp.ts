@@ -123,7 +123,7 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
     server.registerTool(
       'discord_reply_to_origin',
       {
-        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. If omitted, the server recognizes a final question or direct invitation in the reply text for older clients. Explicit false disables that inference for completed answers or quoted questions. In a guild text or announcement channel, a confirmed reply then accepts one plain answer from the same person in that channel for 30 minutes, without another mention. Threads use the existing verified Discord Reply or bot-rooted-thread triggers; expectsResponse does not enable plain answers in other threads. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
+        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. If omitted, the server recognizes unquoted questions or direct invitations in the reply text for older clients. Explicit false disables that inference for completed answers or quoted questions. In a guild text or announcement channel, a confirmed reply then accepts one plain answer from the same person in that channel for 30 minutes, without another mention. Threads use the existing verified Discord Reply or bot-rooted-thread triggers; expectsResponse does not enable plain answers in other threads. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
         inputSchema: z.object({
           eventId: z.string().regex(/^\d{17,20}$/),
           text: z.string().trim().min(1).max(2000),
@@ -655,13 +655,20 @@ async function authorizedContextMessages(
 }
 
 function replyInvitesResponse(text: string): boolean {
-  const line = text.trim().split('\n').at(-1)?.trim() ?? '';
-  if (/^(?:(?:[-*+]|\d+[.)])\s+)*>/u.test(line)) return false;
-  const unquoted = line.replace(/`[^`]*`|"[^"]*"|“[^”]*”|(?<![\p{L}\p{N}])'.*?'(?![\p{L}\p{N}])/gu, '').trim();
-  if (/(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))[.!?,;:*_~]*$/iu.test(unquoted)) return false;
-  const prompt = unquoted.split(/[.!]\s+/u).at(-1)?.trim() ?? '';
-  return /[?？][*_~]*$/u.test(prompt) ||
-    /^(?:[-*+]\s+)?(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+\S/iu.test(prompt);
+  const lines = text.replace(/```[\s\S]*?(?:```|$)/gu, '').trim().split('\n')
+    .map((line) => line.trim().replace(/^(?:(?:[-*+]|\d+[.)])\s+)*/u, ''));
+  for (const line of lines) {
+    // Discord's >>> marker quotes the remainder of the message.
+    if (line.startsWith('>>>')) break;
+    if (line.startsWith('>')) continue;
+    const unquoted = line.replace(/`[^`]*`|"[^"]*"|“[^”]*”|(?<![\p{L}\p{N}])'.*?'(?![\p{L}\p{N}])/gu, '').trim();
+    const questionText = unquoted.replace(/\[[^\]]*\]\([^)]*\)|https?:\/\/\S+/giu, '');
+    if (/[?？][*_~]*(?:\s|$)/u.test(questionText)) return true;
+    if (/(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))[.!?,;:*_~]*$/iu.test(unquoted)) continue;
+    const prompt = unquoted.split(/[.!]\s+/u).at(-1)?.trim() ?? '';
+    if (/^(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+\S/iu.test(prompt)) return true;
+  }
+  return false;
 }
 
 function publicChannelMessage(message: DiscordChannelMessage) {

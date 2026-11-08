@@ -69,7 +69,7 @@ the bridge fails closed instead of delivering a blank role mention.
 
 When a reply asks a question or otherwise invites an answer, the dot should set
 `expectsResponse` on `discord_reply_to_origin`. Older clients can omit the flag:
-the server infers a final question or direct invitation from the reply text.
+the server infers an unquoted question or direct invitation from the reply text.
 This is a conservative text heuristic; the optional flag explicitly overrides
 it for ambiguous replies. Only a confirmed send opens a
 short-lived wait for one plain answer from the same member in the same server
