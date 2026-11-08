@@ -883,6 +883,37 @@ describe('BridgeState awaited channel answers', () => {
     await expect(bridge.recordMention(next)).resolves.toMatchObject({ status: 'rejected' });
   });
 
+  it.each([false, true])('orders conversations by their incoming requests even when older work posts a later reply (newer expectsResponse: %s)', async (expectsResponse) => {
+    const { bridge, source, resources } = await setup(false);
+    await bridge.beginReply(source);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    await bridge.completeReply(secondOrigin, replyId, expectsResponse);
+    const lateReplyId = '77777777777777778';
+    resources.set(`/channels/${candidate.channelId}/messages/${lateReplyId}`, {
+      id: lateReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Stale question',
+    });
+    await bridge.completeReply(source, lateReplyId, true);
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: expectsResponse ? 'accepted' : 'rejected' });
+    if (expectsResponse) await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({ awaitedReply: { messageId: replyId } });
+  });
+
+  it.each(['mention', 'bot reply'])('preserves a question while a newer %s is still awaiting its own response', async (kind) => {
+    const { bridge, resources } = await setup();
+    const second = { ...candidate, messageId: '80000000000000000',
+      ...(kind === 'bot reply' ? { mentionedUserIds: [], replyToMessageId: replyId } : {}) };
+    resources.set(`/channels/${candidate.channelId}/messages/${second.messageId}`, {
+      id: second.messageId, channel_id: candidate.channelId, guild_id: candidate.guildId,
+      author: { id: candidate.authorId, bot: false }, timestamp: second.timestamp, content: 'Another request.',
+      type: 19, message_reference: { message_id: replyId, channel_id: candidate.channelId },
+    });
+    await expect(bridge.recordMention(second)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({ awaitedReply: { messageId: replyId } });
+  });
+
   it('removes retained reply ordering state after retention expires', async () => {
     const { bridge, storage, advance } = await setup();
     expect(storage.alarm).toBe(Date.parse(candidate.timestamp) + 7 * 24 * 60 * 60_000);

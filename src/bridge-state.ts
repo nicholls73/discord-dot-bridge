@@ -217,7 +217,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const currentWait = await transaction.get<AwaitingReply>(waitingKey);
       if (origin.awaitedReply && (!currentWait || currentWait.expiresAt <= this.now() || currentWait.awaitingUntil <= this.now() ||
           currentWait.eventId !== waiting?.eventId || currentWait.messageId !== origin.awaitedReply.messageId)) return 'rejected' as const;
-      if (currentWait && (origin.awaitedReply || BigInt(origin.messageId) > BigInt(currentWait.messageId))) {
+      if (currentWait && origin.awaitedReply) {
         await transaction.put(waitingKey, { ...currentWait, awaitingUntil: 0 });
       }
       if (!await transaction.get(RECOVERY_CURSOR_KEY)) {
@@ -357,8 +357,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       await transaction.put(key, { ...stored, reply: { status: 'replied', replyMessageId } });
       const waitingKey = awaitingReplyKey(origin);
       const waiting = await transaction.get<AwaitingReply>(waitingKey);
-      // A delayed receipt must not replace a newer bot reply's wait.
-      if (!waiting || BigInt(waiting.messageId) < BigInt(replyMessageId)) {
+      // Incoming request order is stable even when older work posts its reply later.
+      if (!waiting || BigInt(waiting.eventId) < BigInt(origin.eventId)) {
         // Retain ordering after an answer or expiry until older reservations can no longer finish.
         await transaction.put<AwaitingReply>(waitingKey, {
           eventId: origin.eventId, messageId: replyMessageId, expiresAt: this.now() + ORIGIN_TTL_MS,
