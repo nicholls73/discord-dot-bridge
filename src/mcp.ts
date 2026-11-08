@@ -123,11 +123,11 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
     server.registerTool(
       'discord_reply_to_origin',
       {
-        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. In a guild text or announcement channel, a confirmed reply then accepts one plain answer from the same person in that channel for 30 minutes, without another mention. Threads use the existing verified Discord Reply or bot-rooted-thread triggers; expectsResponse does not enable plain answers in other threads. Use false for completed answers. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
+        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. If omitted, the server recognizes a final question or direct invitation in the reply text for older clients. Explicit false disables that inference for completed answers or quoted questions. In a guild text or announcement channel, a confirmed reply then accepts one plain answer from the same person in that channel for 30 minutes, without another mention. Threads use the existing verified Discord Reply or bot-rooted-thread triggers; expectsResponse does not enable plain answers in other threads. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
         inputSchema: z.object({
           eventId: z.string().regex(/^\d{17,20}$/),
           text: z.string().trim().min(1).max(2000),
-          expectsResponse: z.boolean().default(false),
+          expectsResponse: z.boolean().optional(),
         }).strict(),
         annotations: { readOnlyHint: false, idempotentHint: false },
       },
@@ -152,7 +152,7 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
             text,
             () => dependencies.origins.isOriginAuthorized(origin),
           );
-          await dependencies.recovery.completeReply(origin, reply.messageId, expectsResponse);
+          await dependencies.recovery.completeReply(origin, reply.messageId, expectsResponse ?? replyInvitesResponse(text));
           return { content: [{ type: 'text', text: JSON.stringify({ eventId, status: 'replied', replyMessageId: reply.messageId }) }] };
         } catch {
           return toolError('The reply was not confirmed. It may already have been sent; do not resend automatically.');
@@ -652,6 +652,13 @@ async function authorizedContextMessages(
   return messages.filter((message) => message.authorIsBot
     ? message.authorId === botUserId
     : memberAccess.get(message.authorId) === 'authorized');
+}
+
+function replyInvitesResponse(text: string): boolean {
+  const prompt = text.trim().split(/(?:\n|[.!]\s+)/u).at(-1)?.trim() ?? '';
+  if (prompt.startsWith('>') || /(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))$/iu.test(prompt)) return false;
+  return /[?？][*_~]*$/u.test(prompt) ||
+    /^(?:[-*+]\s+)?(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+\S/iu.test(prompt);
 }
 
 function publicChannelMessage(message: DiscordChannelMessage) {

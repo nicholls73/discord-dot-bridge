@@ -735,11 +735,26 @@ describe('BridgeState awaited channel answers', () => {
       restart: () => new BridgeStateDO(context as never, env, runtime) };
   }
 
-  it('delivers one plain answer after a confirmed question, surviving restart without another mention', async () => {
+  it.each([
+    { kind: 'explicit question', text: question, expectsResponse: true, acceptsAnswer: true },
+    { kind: 'explicit invitation', text: 'I need another detail.', expectsResponse: true, acceptsAnswer: true },
+    { kind: 'explicit opt-out', text: question, expectsResponse: false, acceptsAnswer: false },
+    { kind: 'legacy question', text: question, acceptsAnswer: true },
+    { kind: 'legacy formatted question', text: `**${question}**`, acceptsAnswer: true },
+    { kind: 'legacy invitation', text: 'Tell me which checklist to review.', acceptsAnswer: true },
+    { kind: 'legacy final invitation', text: 'I can help. Let me know which checklist to review.', acceptsAnswer: true },
+    { kind: 'legacy completed answer', text: 'The checklist is ready.', acceptsAnswer: false },
+    { kind: 'legacy quoted question', text: 'The checklist says "Ready?".', acceptsAnswer: false },
+    { kind: 'legacy quoted block', text: '> Which checklist should I review?', acceptsAnswer: false },
+    { kind: 'legacy link', text: 'Checklist: https://example.test/checklist?', acceptsAnswer: false },
+  ])('handles a $kind through MCP and retains a single-use wait across restart', async ({ text, expectsResponse, acceptsAnswer }) => {
     const fixture = await setup(false);
     const { bridge, env, resources } = fixture;
     const discord = new DiscordRestMessenger(env.DISCORD_BOT_TOKEN,
-      vi.fn(async () => Response.json({ id: replyId })));
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        resources.get(`/channels/${candidate.channelId}/messages/${replyId}`).content = JSON.parse(String(init?.body)).content;
+        return Response.json({ id: replyId });
+      }));
     const handler = createBridgeMcpHandler({ policy: bridge, origins: bridge, recovery: bridge,
       channelAccess: bridge, outbound: bridge, discord, events: bridge, listChannels: async () => [], env });
     const authInfo: AuthInfo = { token: 'synthetic-access-token', clientId: 'synthetic-client',
@@ -751,16 +766,21 @@ describe('BridgeState awaited channel answers', () => {
     }));
     try {
       const response = await client.callTool({ name: 'discord_reply_to_origin', arguments: {
-        eventId: candidate.messageId, text: question, expectsResponse: true,
+        eventId: candidate.messageId, text,
+        ...(expectsResponse === undefined ? {} : { expectsResponse }),
       } });
       expect(response.isError).not.toBe(true);
     } finally { await client.close(); }
     const restarted = fixture.restart();
     await restarted.subscribe(testSubscription(Date.parse(candidate.timestamp)));
     fixture.advance(5 * 60_000);
-    await expect(restarted.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(restarted.recordMention(answer)).resolves.toMatchObject({ status: acceptsAnswer ? 'accepted' : 'rejected' });
+    if (!acceptsAnswer) {
+      await expect(restarted.getOrigin(answer.messageId)).resolves.toBeNull();
+      return;
+    }
     await expect(restarted.getOrigin(answer.messageId)).resolves.toMatchObject({
-      content: 'The launch checklist.', awaitedReply: { messageId: replyId, text: question },
+      content: 'The launch checklist.', awaitedReply: { messageId: replyId, text },
     });
     const pending = await restarted.listPendingMentions('owner@example.test', testAuthorization, 10);
     expect(pending.events.map((event) => event.eventId)).toEqual([answer.messageId]);
