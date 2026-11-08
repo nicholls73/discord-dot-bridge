@@ -656,7 +656,7 @@ async function authorizedContextMessages(
 
 function replyInvitesResponse(text: string): boolean {
   const line = text.trim().split('\n').at(-1)?.trim() ?? '';
-  if (line.startsWith('>')) return false;
+  if (/^(?:(?:[-*+]|\d+[.)])\s+)*>/u.test(line)) return false;
   const unquoted = line.replace(/`[^`]*`|"[^"]*"|“[^”]*”|(?<![\p{L}\p{N}])'.*?'(?![\p{L}\p{N}])/gu, '').trim();
   if (/(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))[.!?,;:*_~]*$/iu.test(unquoted)) return false;
   const prompt = unquoted.split(/[.!]\s+/u).at(-1)?.trim() ?? '';

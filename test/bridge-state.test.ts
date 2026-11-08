@@ -748,6 +748,8 @@ describe('BridgeState awaited channel answers', () => {
     { kind: 'legacy quoted question', text: 'The checklist says "Ready?".', acceptsAnswer: false },
     { kind: 'legacy quoted block', text: '> Which checklist should I review?', acceptsAnswer: false },
     { kind: 'legacy multi-sentence quoted block', text: '> Example prompt. Which checklist should I review?', acceptsAnswer: false },
+    { kind: 'legacy bulleted quoted block', text: '- > Which checklist should I review?', acceptsAnswer: false },
+    { kind: 'legacy numbered quoted block', text: '1. > Which checklist should I review?', acceptsAnswer: false },
     { kind: 'legacy inline quoted invitation', text: 'Example: "Start here. Tell me which checklist to review?"', acceptsAnswer: false },
     { kind: 'legacy single-quoted question', text: "Example: 'Which checklist should I review?'", acceptsAnswer: false },
     { kind: 'legacy single-quoted invitation', text: "Example: 'Start here. Tell me which checklist to review?'", acceptsAnswer: false },
