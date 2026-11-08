@@ -84,6 +84,8 @@ const DISCORD_ROLE_NAMES_KEY = 'discord:role-names';
 const DISCORD_OAUTH_STATE_KEY = 'discord:oauth-state';
 const DISCORD_LINK_KEY_PREFIX = 'discord:linked-account:';
 const OUTBOUND_MESSAGE_PREFIX = 'outbound-message:';
+const AWAITING_REPLY_PREFIX = 'awaiting-reply:';
+const AWAITING_REPLY_TTL_MS = 30 * 60_000;
 const DISCORD_GUILD_NAMES_KEY = 'discord:guild-names';
 const DISCORD_OAUTH_STATE_TTL_MS = 10 * 60_000;
 const DISCORD_GUILD_CANDIDATE_TTL_MS = 5 * 60_000;
@@ -98,6 +100,13 @@ interface StoredOrigin extends OriginMessage {
   expiresAt: number;
   recipients?: Array<{ id: string; recoveryId: string }>;
   reply?: ReplyState;
+}
+
+interface AwaitingReply {
+  eventId: string;
+  messageId: string;
+  awaitingUntil: number;
+  expiresAt: number;
 }
 
 interface StandaloneMessageRecord {
@@ -164,23 +173,30 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   async recordOriginOnce(origin: OriginMessage): Promise<'accepted' | 'duplicate' | 'rejected'> {
     if (origin.eventId !== origin.messageId || validateMessageCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null) return 'rejected';
     // Conversation triggers are verified with Discord, never accepted from the caller.
-    const { thread: _thread, botReply: _botReply, ...incoming } = origin;
+    const { thread: _thread, botReply: _botReply, awaitedReply: _awaitedReply, ...incoming } = origin;
     origin = incoming;
+    const waitingKey = awaitingReplyKey(origin);
+    const waiting = await this.ctx.storage.get<AwaitingReply>(waitingKey);
+    const isWaiting = waiting && waiting.expiresAt > this.now() && waiting.awaitingUntil > this.now();
+    const previous = await this.ctx.storage.get<StoredOrigin>(`origin:${origin.eventId}`);
+    const duplicate = previous && previous.expiresAt > this.now() && sameOrigin(previous, { ...origin, content: previous.content });
     if (validateMentionCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null &&
-        !origin.replyToMessageId && this.nonThreadChannels.has(origin.channelId)) return 'rejected';
+        !origin.replyToMessageId && !isWaiting && !duplicate && this.nonThreadChannels.has(origin.channelId)) return 'rejected';
     const config = await this.getDiscordAuthorization();
     if (!config.guilds[origin.guildId]) return 'rejected';
     const member = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
     if (member.status !== 'member' || !hasDiscordAccess(config, origin.guildId, origin.authorId, member.roleIds)) {
       return 'rejected';
     }
+    if (duplicate) return 'duplicate';
 
     let roleIds = member.roleIds;
     if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
       const content = await this.readBotRoleMention(origin);
       if (content !== null) origin = { ...origin, content };
       else {
-        const followUp = await this.readBotReply(origin) ?? await this.readBotThreadReply(origin);
+        const followUp = await this.readBotReply(origin) ??
+          (isWaiting ? await this.readAwaitedReply(origin, waiting) : null) ?? await this.readBotThreadReply(origin);
         if (!followUp) return 'rejected';
         origin = { ...origin, ...followUp };
       }
@@ -196,6 +212,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const current = decodeDiscordAuthorization(await transaction.get<unknown>(AUTHORIZATION_KEY));
       if (!hasDiscordAccess(current, origin.guildId, origin.authorId, roleIds)) return 'rejected' as const;
       if (await transaction.get<OriginMessage>(originKey)) return false;
+      const currentWait = await transaction.get<AwaitingReply>(waitingKey);
+      if (origin.awaitedReply && (!currentWait || currentWait.expiresAt <= this.now() || currentWait.awaitingUntil <= this.now() ||
+          currentWait.eventId !== waiting?.eventId || currentWait.messageId !== origin.awaitedReply.messageId)) return 'rejected' as const;
+      if (currentWait && origin.awaitedReply) {
+        await transaction.put(waitingKey, { ...currentWait, awaitingUntil: 0 });
+      }
       if (!await transaction.get(RECOVERY_CURSOR_KEY)) {
         await transaction.put(RECOVERY_CURSOR_KEY, crypto.getRandomValues(new Uint8Array(32)));
       }
@@ -320,8 +342,9 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     });
   }
 
-  async completeReply(origin: OriginMessage, replyMessageId: string): Promise<void> {
+  async completeReply(origin: OriginMessage, replyMessageId: string, expectsResponse = false): Promise<void> {
     if (!/^\d{17,20}$/.test(replyMessageId)) throw new TypeError('Invalid reply ID.');
+    if (typeof expectsResponse !== 'boolean') throw new TypeError('expectsResponse must be a boolean.');
     await this.ctx.storage.transaction(async (transaction) => {
       const key = `origin:${origin.eventId}`;
       const stored = await transaction.get<StoredOrigin>(key);
@@ -331,7 +354,18 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       if (stored.reply?.status === 'replied' && stored.reply.replyMessageId === replyMessageId) return;
       if (stored.reply?.status !== 'reply_started') throw new TypeError('Reply reservation is unavailable or already completed.');
       await transaction.put(key, { ...stored, reply: { status: 'replied', replyMessageId } });
+      const waitingKey = awaitingReplyKey(origin);
+      const waiting = await transaction.get<AwaitingReply>(waitingKey);
+      // Incoming request order is stable even when older work posts its reply later.
+      if (!waiting || BigInt(waiting.eventId) < BigInt(origin.eventId)) {
+        // Retain ordering after an answer or expiry until older reservations can no longer finish.
+        await transaction.put<AwaitingReply>(waitingKey, {
+          eventId: origin.eventId, messageId: replyMessageId, expiresAt: this.now() + ORIGIN_TTL_MS,
+          awaitingUntil: expectsResponse ? this.now() + AWAITING_REPLY_TTL_MS : 0,
+        });
+      }
     });
+    await this.scheduleNextWake();
   }
 
   async isChannelAuthorized(ownerEmail: string, guildId: string): Promise<boolean> {
@@ -1096,15 +1130,35 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
           ![0, 5, 10, 11, 12].includes(channel.type)) return null;
       const message = await this.readIncomingMessage(origin);
       if (!message?.content.trim() || discordReplyMessageId(message, origin.guildId, origin.channelId) !== origin.replyToMessageId) return null;
-      const target = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${origin.replyToMessageId}`);
-      if (!target || target.id !== origin.replyToMessageId || target.channel_id !== origin.channelId ||
-          (target.guild_id !== undefined && target.guild_id !== origin.guildId) ||
-          target.author?.id !== this.env.DISCORD_BOT_USER_ID || target.author.bot !== true ||
-          target.webhook_id !== undefined || typeof target.content !== 'string' || target.content.length > 2000) return null;
-      return { content: message.content, botReply: { messageId: target.id, text: target.content } };
+      const text = await this.readBotMessage(origin, origin.replyToMessageId);
+      return text === null ? null : { content: message.content, botReply: { messageId: origin.replyToMessageId, text } };
     } catch {
       return null;
     }
+  }
+
+  private async readAwaitedReply(origin: OriginMessage, waiting: AwaitingReply): Promise<Pick<OriginMessage, 'content' | 'awaitedReply'> | null> {
+    if (origin.replyToMessageId || origin.mentionedUserIds.length || origin.mentionedRoleIds?.length ||
+        waiting.expiresAt <= this.now() || waiting.awaitingUntil <= this.now() || BigInt(origin.messageId) <= BigInt(waiting.messageId)) return null;
+    try {
+      const channel = await this.readDiscordResource(`/channels/${origin.channelId}`);
+      if (!channel || channel.id !== origin.channelId || channel.guild_id !== origin.guildId || ![0, 5].includes(channel.type)) return null;
+      const message = await this.readIncomingMessage(origin);
+      if (!message?.content.trim() || message.type !== 0 || message.message_reference !== undefined) return null;
+      const text = await this.readBotMessage(origin, waiting.messageId);
+      return !text?.trim() ? null : { content: message.content, awaitedReply: { messageId: waiting.messageId, text } };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readBotMessage(origin: OriginMessage, messageId: string): Promise<string | null> {
+    const target = await this.readDiscordResource(`/channels/${origin.channelId}/messages/${messageId}`);
+    if (!target || target.id !== messageId || target.channel_id !== origin.channelId ||
+        (target.guild_id !== undefined && target.guild_id !== origin.guildId) ||
+        target.author?.id !== this.env.DISCORD_BOT_USER_ID || target.author.bot !== true ||
+        target.webhook_id !== undefined || typeof target.content !== 'string' || target.content.length > 2000) return null;
+    return target.content;
   }
 
   private async getCurrentMemberRoles(
@@ -1404,6 +1458,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     await this.ctx.storage.transaction(async (transaction) => {
       const deliveries = await transaction.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
       const origins = await transaction.list<StoredOrigin>({ prefix: 'origin:' });
+      const awaitingReplies = await transaction.list<AwaitingReply>({ prefix: AWAITING_REPLY_PREFIX });
       const gatewayAlarmAt = await transaction.get<number>(GATEWAY_ALARM_KEY);
       const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
       const linkedAccount = ownerEmail
@@ -1433,6 +1488,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         oauthStateExpiry,
         ...[...deliveries.values()].map((delivery) => delivery.nextAttemptAt),
         ...originExpiryTimes,
+        ...[...awaitingReplies.values()].map((waiting) => waiting.expiresAt),
       );
       if (Number.isFinite(next)) await transaction.setAlarm(Math.max(this.now() + 1, next));
       else await transaction.deleteAlarm();
@@ -1465,6 +1521,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     for (const [key, origin] of origins) {
       if (typeof origin.expiresAt !== 'number' || origin.expiresAt <= this.now()) await this.ctx.storage.delete(key);
     }
+    await this.ctx.storage.transaction(async (transaction) => {
+      const awaitingReplies = await transaction.list<AwaitingReply>({ prefix: AWAITING_REPLY_PREFIX });
+      for (const [key, waiting] of awaitingReplies) {
+        if (waiting.expiresAt <= this.now()) await transaction.delete(key);
+      }
+    });
   }
 
   private async pruneExpiredDiscordCandidates(): Promise<void> {
@@ -1526,6 +1588,10 @@ function isStandaloneMessageRecord(value: unknown): value is StandaloneMessageRe
     typeof record.nonce === 'string' && record.nonce.length > 0 && record.nonce.length <= 25 &&
     (record.status === 'message_started' || record.status === 'sent') &&
     (record.status !== 'sent' || /^\d{17,20}$/.test(record.messageId ?? ''));
+}
+
+function awaitingReplyKey(origin: OriginMessage): string {
+  return `${AWAITING_REPLY_PREFIX}${origin.guildId}:${origin.channelId}:${origin.authorId}`;
 }
 
 function sameOrigin(stored: OriginMessage, candidate: OriginMessage): boolean {

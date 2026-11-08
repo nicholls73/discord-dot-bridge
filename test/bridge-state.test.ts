@@ -694,6 +694,273 @@ describe('BridgeState Durable Object outbox', () => {
   });
 });
 
+describe('BridgeState awaited channel answers', () => {
+  const replyId = '77777777777777777';
+  const answer = { ...candidate, messageId: '88888888888888888', mentionedUserIds: [], content: '',
+    timestamp: '2026-10-04T12:05:00.000Z' };
+  const question = 'Which checklist should I review?';
+
+  async function setup(arm = true) {
+    let now = Date.parse(candidate.timestamp);
+    const storage = new MemoryStorage();
+    const resources = new Map<string, any>([
+      [`/channels/${candidate.channelId}`, { id: candidate.channelId, guild_id: candidate.guildId, type: 0 }],
+      [`/channels/${candidate.channelId}/messages/${replyId}`, {
+        id: replyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: question,
+      }],
+      [`/channels/${answer.channelId}/messages/${answer.messageId}`, {
+        id: answer.messageId, channel_id: answer.channelId, guild_id: answer.guildId,
+        author: { id: answer.authorId, bot: false }, timestamp: answer.timestamp, content: 'The launch checklist.', type: 0,
+      }],
+    ]);
+    const discordFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes('/members/')) return memberFetch()(input);
+      const value = resources.get(url.pathname.replace('/api/v10', ''));
+      return value === undefined ? new Response(null, { status: 404 }) : Response.json(value);
+    });
+    const context = { storage, waitUntil: () => undefined };
+    const env = testEnv();
+    const runtime = { ...testRuntime(), discordFetch, now: () => now };
+    const bridge = new BridgeStateDO(context as never, env, runtime);
+    await grantUser(bridge);
+    await bridge.recordMention(candidate);
+    const source = (await bridge.getOrigin(candidate.messageId))!;
+    if (arm) {
+      await bridge.beginReply(source);
+      await bridge.completeReply(source, replyId, true);
+    }
+    return { bridge, source, storage, resources, discordFetch, env,
+      advance: (ms: number) => { now += ms; },
+      restart: () => new BridgeStateDO(context as never, env, runtime) };
+  }
+
+  it('delivers one plain answer after a confirmed question, surviving restart without another mention', async () => {
+    const fixture = await setup(false);
+    const { bridge, env, resources } = fixture;
+    const discord = new DiscordRestMessenger(env.DISCORD_BOT_TOKEN,
+      vi.fn(async () => Response.json({ id: replyId })));
+    const handler = createBridgeMcpHandler({ policy: bridge, origins: bridge, recovery: bridge,
+      channelAccess: bridge, outbound: bridge, discord, events: bridge, listChannels: async () => [], env });
+    const authInfo: AuthInfo = { token: 'synthetic-access-token', clientId: 'synthetic-client',
+      scopes: [READ_SCOPE, REPLY_SCOPE], extra: { userId: 'owner@example.test' } };
+    const client = new Client({ name: 'awaited-answer-test', version: '1.0.0' },
+      { versionNegotiation: { mode: { pin: '2026-07-28' } } });
+    await client.connect(new StreamableHTTPClientTransport(new URL('https://discord-dot.test/mcp'), {
+      fetch: (input, init) => handler.fetch(new Request(input, init), { authInfo }),
+    }));
+    try {
+      const response = await client.callTool({ name: 'discord_reply_to_origin', arguments: {
+        eventId: candidate.messageId, text: question, expectsResponse: true,
+      } });
+      expect(response.isError).not.toBe(true);
+    } finally { await client.close(); }
+    const restarted = fixture.restart();
+    await restarted.subscribe(testSubscription(Date.parse(candidate.timestamp)));
+    fixture.advance(5 * 60_000);
+    await expect(restarted.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(restarted.getOrigin(answer.messageId)).resolves.toMatchObject({
+      content: 'The launch checklist.', awaitedReply: { messageId: replyId, text: question },
+    });
+    const pending = await restarted.listPendingMentions('owner@example.test', testAuthorization, 10);
+    expect(pending.events.map((event) => event.eventId)).toEqual([answer.messageId]);
+    await expect(restarted.recordMention(answer)).resolves.toMatchObject({ status: 'duplicate' });
+    // Retrying the completed question must not re-arm a consumed wait.
+    await restarted.completeReply(fixture.source, replyId, true);
+    const next = { ...answer, messageId: '99999999999999999' };
+    resources.set(`/channels/${next.channelId}/messages/${next.messageId}`, {
+      ...resources.get(`/channels/${answer.channelId}/messages/${answer.messageId}`), id: next.messageId,
+    });
+    await expect(restarted.recordMention(next)).resolves.toMatchObject({ status: 'rejected' });
+  });
+
+  it('accepts an awaited answer even after caching the channel as ordinary traffic', async () => {
+    const { bridge, source } = await setup(false);
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'rejected' });
+    await bridge.beginReply(source);
+    await bridge.completeReply(source, replyId, true);
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+  });
+
+  it.each(['not waiting', 'unconfirmed send', 'expired', 'older than question', 'other person', 'other channel', 'other server', 'revoked'])('ignores a plain answer with %s', async (kind) => {
+    const { bridge, source, advance } = await setup(!['not waiting', 'unconfirmed send'].includes(kind));
+    if (kind === 'not waiting' || kind === 'unconfirmed send') {
+      await bridge.beginReply(source);
+      if (kind === 'not waiting') await bridge.completeReply(source, replyId);
+    }
+    if (kind === 'expired') advance(30 * 60_000);
+    if (kind === 'revoked') await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+    const incoming = { ...answer,
+      ...(kind === 'older than question' ? { messageId: '66666666666666667' } : {}),
+      ...(kind === 'other person' ? { authorId: '99999999999999999' } : {}),
+      ...(kind === 'other channel' ? { channelId: '99999999999999999' } : {}),
+      ...(kind === 'other server' ? { guildId: '99999999999999999' } : {}),
+    };
+    if (kind === 'other person') await grantUser(bridge, incoming.authorId);
+    await expect(bridge.recordMention(incoming)).resolves.toMatchObject({ status: 'rejected' });
+    await expect(bridge.getOrigin(incoming.messageId)).resolves.toBeNull();
+  });
+
+  it.each(['missing content', 'wrong incoming author', 'human question', 'wrong question channel', 'reply to someone else', 'revoked during lookup', 'expired during lookup'])('rejects %s without accepting the follow-up', async (kind) => {
+    const { bridge, resources, discordFetch, advance } = await setup();
+    const incoming = resources.get(`/channels/${answer.channelId}/messages/${answer.messageId}`);
+    const target = resources.get(`/channels/${answer.channelId}/messages/${replyId}`);
+    if (kind === 'missing content') incoming.content = '';
+    if (kind === 'wrong incoming author') incoming.author.id = '99999999999999999';
+    if (kind === 'human question') target.author = { id: candidate.authorId, bot: false };
+    if (kind === 'wrong question channel') target.channel_id = '99999999999999999';
+    if (kind === 'reply to someone else') Object.assign(incoming, { type: 19, message_reference: { message_id: candidate.messageId } });
+    const read = discordFetch.getMockImplementation()!;
+    discordFetch.mockImplementation(async (input) => {
+      const response = await read(input);
+      if (String(input).endsWith(`/messages/${answer.messageId}`)) {
+        if (kind === 'revoked during lookup') await bridge.mutateDiscordAuthorization({ action: 'revoke-user', guildId: candidate.guildId, id: candidate.authorId });
+        if (kind === 'expired during lookup') advance(30 * 60_000);
+      }
+      return response;
+    });
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'rejected' });
+    await expect(bridge.getOrigin(answer.messageId)).resolves.toBeNull();
+  });
+
+  it('consumes the wait atomically when two different answers arrive together', async () => {
+    const { bridge, resources } = await setup();
+    const next = { ...answer, messageId: '99999999999999999' };
+    resources.set(`/channels/${next.channelId}/messages/${next.messageId}`, {
+      ...resources.get(`/channels/${answer.channelId}/messages/${answer.messageId}`), id: next.messageId,
+    });
+    const results = await Promise.all([bridge.recordMention(answer), bridge.recordMention(next)]);
+    expect(results.map((result) => result.status).sort()).toEqual(['accepted', 'rejected']);
+  });
+
+  it('does not accept caller-supplied awaited-reply context without a saved wait', async () => {
+    const { bridge } = await setup(false);
+    await expect(bridge.recordOriginOnce({ ...answer, eventId: answer.messageId, messageUrl: '',
+      awaitedReply: { messageId: replyId, text: question } })).resolves.toBe('rejected');
+  });
+
+  it.each(['reply ID', 'expectsResponse'])('identifies an invalid %s without completing the reserved reply', async (kind) => {
+    const { bridge, source } = await setup(false);
+    await bridge.beginReply(source);
+    await expect(bridge.completeReply(source, kind === 'reply ID' ? 'invalid' : replyId,
+      kind === 'expectsResponse' ? 'yes' as unknown as boolean : true)).rejects.toThrow(
+      kind === 'reply ID' ? 'Invalid reply ID.' : 'expectsResponse must be a boolean.',
+    );
+    await expect(bridge.beginReply(source)).resolves.toEqual({ status: 'reply_started' });
+  });
+
+  it.each([false, true])('keeps the newer question when an older receipt completes late (expectsResponse: %s)', async (expectsResponse) => {
+    const { bridge, source, resources } = await setup(false);
+    const newerReplyId = '77777777777777778';
+    await bridge.beginReply(source);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    await bridge.completeReply(secondOrigin, newerReplyId, true);
+    resources.set(`/channels/${candidate.channelId}/messages/${newerReplyId}`, {
+      id: newerReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Which version?',
+    });
+    await bridge.completeReply(source, replyId, expectsResponse);
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({
+      awaitedReply: { messageId: newerReplyId, text: 'Which version?' },
+    });
+  });
+
+  it.each(['answered', 'finished', 'expired'])('does not reopen an older question after the newer conversation is %s', async (kind) => {
+    const { bridge, source, resources, advance } = await setup(false);
+    await bridge.beginReply(source);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    const newerReplyId = '77777777777777778';
+    await bridge.completeReply(secondOrigin, newerReplyId, kind !== 'finished');
+    resources.set(`/channels/${candidate.channelId}/messages/${newerReplyId}`, {
+      id: newerReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Which version?',
+    });
+    if (kind === 'answered') await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    if (kind === 'expired') {
+      advance(30 * 60_000);
+      await bridge.alarm();
+    }
+    await bridge.completeReply(source, replyId, true);
+    const next = { ...answer, messageId: '99999999999999999' };
+    resources.set(`/channels/${next.channelId}/messages/${next.messageId}`, {
+      ...resources.get(`/channels/${answer.channelId}/messages/${answer.messageId}`), id: next.messageId,
+    });
+    await expect(bridge.recordMention(next)).resolves.toMatchObject({ status: 'rejected' });
+  });
+
+  it.each([false, true])('orders conversations by their incoming requests even when older work posts a later reply (newer expectsResponse: %s)', async (expectsResponse) => {
+    const { bridge, source, resources } = await setup(false);
+    await bridge.beginReply(source);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    await bridge.completeReply(secondOrigin, replyId, expectsResponse);
+    const lateReplyId = '77777777777777778';
+    resources.set(`/channels/${candidate.channelId}/messages/${lateReplyId}`, {
+      id: lateReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Stale question',
+    });
+    await bridge.completeReply(source, lateReplyId, true);
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: expectsResponse ? 'accepted' : 'rejected' });
+    if (expectsResponse) await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({ awaitedReply: { messageId: replyId } });
+  });
+
+  it.each(['mention', 'bot reply'])('preserves a question while a newer %s is still awaiting its own response', async (kind) => {
+    const { bridge, resources } = await setup();
+    const second = { ...candidate, messageId: '80000000000000000',
+      ...(kind === 'bot reply' ? { mentionedUserIds: [], replyToMessageId: replyId } : {}) };
+    resources.set(`/channels/${candidate.channelId}/messages/${second.messageId}`, {
+      id: second.messageId, channel_id: candidate.channelId, guild_id: candidate.guildId,
+      author: { id: candidate.authorId, bot: false }, timestamp: second.timestamp, content: 'Another request.',
+      type: 19, message_reference: { message_id: replyId, channel_id: candidate.channelId },
+    });
+    await expect(bridge.recordMention(second)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({ awaitedReply: { messageId: replyId } });
+  });
+
+  it('removes retained reply ordering state after retention expires', async () => {
+    const { bridge, storage, advance } = await setup();
+    expect(storage.alarm).toBe(Date.parse(candidate.timestamp) + 7 * 24 * 60 * 60_000);
+    advance(7 * 24 * 60 * 60_000);
+    await bridge.alarm();
+    expect((await storage.list({ prefix: 'awaiting-reply:' })).size).toBe(0);
+  });
+
+  it('preserves a new question completed while an older wait is being pruned', async () => {
+    const { bridge, storage, resources, advance } = await setup();
+    advance(7 * 24 * 60 * 60_000 - 60_000);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    const newerReplyId = '77777777777777778';
+    resources.set(`/channels/${candidate.channelId}/messages/${newerReplyId}`, {
+      id: newerReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Which version?',
+    });
+    advance(60_000);
+    const list = storage.list.bind(storage);
+    let completion: Promise<void> | undefined;
+    vi.spyOn(storage, 'list').mockImplementation(async (options) => {
+      const snapshot = await list(options);
+      if (options?.prefix === 'awaiting-reply:' && !completion) {
+        completion = bridge.completeReply(secondOrigin, newerReplyId, true);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      return snapshot;
+    });
+    await bridge.alarm();
+    await completion;
+    await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    await expect(bridge.getOrigin(answer.messageId)).resolves.toMatchObject({ awaitedReply: { messageId: newerReplyId } });
+  });
+});
+
 describe('BridgeState bot thread follow-ups', () => {
   const parentId = '77777777777777777';
   const followUp = { ...candidate, mentionedUserIds: [], content: '' };

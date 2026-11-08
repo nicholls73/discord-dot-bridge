@@ -29,6 +29,7 @@ export interface OriginMessage extends GatewayMentionCandidate {
   eventId: string;
   messageUrl: string;
   botReply?: { messageId: string; text: string };
+  awaitedReply?: { messageId: string; text: string };
   thread?: {
     parentChannelId: string;
     starterMessageId: string;
@@ -136,6 +137,12 @@ export function validateMentionCandidate(candidate: GatewayMentionCandidate, bot
 
 export function isAllowedOrigin(origin: OriginMessage, botUserId: string | undefined): boolean {
   if (origin.eventId !== origin.messageId || validateMessageCandidate(origin, botUserId) !== null) return false;
+  if (origin.awaitedReply) return Boolean(
+    origin.mentionedUserIds.length === 0 && !origin.mentionedRoleIds?.length && !origin.replyToMessageId &&
+    typeof origin.awaitedReply.messageId === 'string' && isDiscordSnowflake(origin.awaitedReply.messageId) &&
+    BigInt(origin.awaitedReply.messageId) < BigInt(origin.messageId) &&
+    typeof origin.awaitedReply.text === 'string' && origin.awaitedReply.text.length <= 2000 && origin.content.trim(),
+  );
   if (validateMentionCandidate(origin, botUserId) === null) return true;
   if (origin.botReply && typeof origin.botReply.messageId === 'string' && isDiscordSnowflake(origin.botReply.messageId) &&
       origin.botReply.messageId === origin.replyToMessageId &&

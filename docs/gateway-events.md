@@ -5,7 +5,7 @@ After completing the [deployment guide](deployment.md), configure Discord permis
 ## Discord permissions
 
 1. Install your own Discord bot only into servers you intend to approve. Give it access only to channels where approved members may mention it. Mention replies need `VIEW_CHANNEL` and `SEND_MESSAGES`; replies inside threads use `SEND_MESSAGES_IN_THREADS`. Message lookups also need `READ_MESSAGE_HISTORY`; standalone sends need `SEND_MESSAGES` in channels or `SEND_MESSAGES_IN_THREADS` in threads plus history access. Own-message edits remain limited to channels and need channel permissions and history access. The admin invite link requests these permissions, but channel-specific overwrites can still deny them.
-2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so direct mention handling does not require that intent. HTTP reads of other message content require Message Content access for the Discord application in the Developer Portal. This changes no Gateway identify intent. Unmentioned traffic only triggers a response to [direct replies and threads started from the bot's messages](#follow-ups-in-threads-started-from-the-bot). The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
+2. The Gateway requests only `GUILD_MESSAGES`. Direct bot mentions include content without the privileged `MESSAGE_CONTENT` intent, so direct mention handling does not require that intent. HTTP reads of other message content require Message Content access for the Discord application in the Developer Portal. This changes no Gateway identify intent. Unmentioned traffic triggers only [verified conversation follow-ups](#follow-ups-without-another-mention). The Worker discovers the Gateway URL with `GET /api/v10/gateway/bot`, then saves `READY.resume_gateway_url` and the latest dispatch sequence for session resume. See [Discord Message Content intent](https://docs.discord.com/developers/events/gateway#message-content-intent) and the [Message resource](https://docs.discord.com/developers/resources/message).
 3. Configure credentials through the [deployment guide](deployment.md). Server, user and role grants are managed at runtime, not through deployment variables.
 
 ## Connect the dot
@@ -65,7 +65,23 @@ existing Message Content access and the bot's `VIEW_CHANNEL` and
 permissions. If REST content is unavailable, use the bot-account mention;
 the bridge fails closed instead of delivering a blank role mention.
 
-## Follow-ups in threads started from the bot
+## Follow-ups without another mention
+
+When a reply asks a question or otherwise invites an answer, the dot should set
+`expectsResponse` on `discord_reply_to_origin`. Only a confirmed send opens a
+short-lived wait for one plain answer from the same member in the same server
+and text or announcement channel. The next accepted answer consumes that wait;
+a subsequent question must open another one. Waits survive Worker restarts, but
+expired waits and uncertain sends cannot enable this trigger. The
+[bridge implementation](../src/bridge-state.ts) owns the expiry and validation.
+
+The bridge verifies the incoming answer and the bot's question through REST,
+then returns the question as `awaitedReply` context. Messages directed to
+someone else through Reply or a mention do not count as plain answers. This
+uses the application's existing Message Content access and server/member grants;
+it changes no Gateway intent or OAuth scope. Without readable REST content,
+use a direct bot-account mention. This question/answer state is separate from
+the [owner-managed response policy](response-policy.md).
 
 Approved members can continue a public or announcement thread started from the
 bot's own message without repeating its mention. The bridge verifies the
@@ -91,8 +107,9 @@ server, the incoming message's actual reply reference, and the target bot author
 through REST. A forwarded message or a reply to another person does not enable
 this trigger. The origin includes that bot message as `botReply` context.
 
-Plain messages in ordinary channels, threads rooted in someone else's message,
-and private threads still require an explicit mention or Reply to the bot.
+Outside an active wait, plain messages in ordinary channels still require an
+explicit mention or Reply to the bot. Threads rooted in someone else's message
+and private threads also require an explicit mention or Reply to the bot.
 Private threads also require Discord to give the bot access to that thread.
 
 ## Conversation context
@@ -103,6 +120,11 @@ and reply chain. In a public or announcement thread it also follows the starter
 back into the parent channel, so a follow-up can refer to the original request.
 The [tool implementation](../src/mcp.ts) owns the bounds and result fields. The
 standalone history tool's supported channel types are unchanged.
+
+The origin read also identifies the actual immediately preceding message and
+its permalink when that message is authorized. This lets the dot resolve
+"the above message" directly. If that message is hidden, an older visible
+message is never presented as the immediate predecessor.
 
 Context reads require current linked-owner access to the approved server and
 the bot's view/history permissions. They return only this bot's messages and

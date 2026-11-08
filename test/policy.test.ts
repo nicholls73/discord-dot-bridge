@@ -33,6 +33,25 @@ function candidate(overrides: Partial<GatewayMentionCandidate> = {}): GatewayMen
 }
 
 describe('runtime Discord authorization policy', () => {
+  it.each(['human mention', 'bot mention', 'role mention'])('rejects an awaited-answer record containing a %s', (kind) => {
+    const origin = toOriginMessage(candidate({ mentionedUserIds: kind === 'human mention' ? [ROLE] : kind === 'bot mention' ? [BOT] : [],
+      mentionedRoleIds: kind === 'role mention' ? [ROLE] : [] }));
+    expect(isAllowedOrigin({ ...origin, awaitedReply: { messageId: '55555555555555554', text: 'Which proposal?' } }, BOT)).toBe(false);
+  });
+
+  it('accepts only a valid older awaited bot reply as an unmentioned conversation trigger', () => {
+    const origin = toOriginMessage(candidate({ mentionedUserIds: [] }));
+    const awaitedReply = { messageId: '55555555555555554', text: 'Which proposal?' };
+    expect(isAllowedOrigin({ ...origin, awaitedReply }, BOT)).toBe(true);
+    for (const invalid of [
+      { ...awaitedReply, messageId: undefined as unknown as string },
+      { ...awaitedReply, messageId: '77777777777777777' },
+      { ...awaitedReply, text: 'x'.repeat(2001) },
+    ]) expect(isAllowedOrigin({ ...origin, awaitedReply: invalid }, BOT)).toBe(false);
+    expect(isAllowedOrigin({ ...origin, content: ' ', awaitedReply }, BOT)).toBe(false);
+    expect(isAllowedOrigin({ ...origin, replyToMessageId: '44444444444444444', awaitedReply }, BOT)).toBe(false);
+  });
+
   it('requires a valid verified bot reply target for an unmentioned origin', () => {
     const origin = toOriginMessage(candidate({ mentionedUserIds: [] }));
     expect(isAllowedOrigin({ ...origin, botReply: { messageId: undefined as unknown as string, text: 'Forged' } }, BOT)).toBe(false);
