@@ -655,8 +655,11 @@ async function authorizedContextMessages(
 }
 
 function replyInvitesResponse(text: string): boolean {
-  const prompt = text.trim().split(/(?:\n|[.!]\s+)/u).at(-1)?.trim() ?? '';
-  if (prompt.startsWith('>') || /(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))$/iu.test(prompt)) return false;
+  const line = text.trim().split('\n').at(-1)?.trim() ?? '';
+  if (line.startsWith('>')) return false;
+  const unquoted = line.replace(/`[^`]*`|"[^"]*"|“[^”]*”/gu, '').trim();
+  if (/(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))[.!?,;:*_~]*$/iu.test(unquoted)) return false;
+  const prompt = unquoted.split(/[.!]\s+/u).at(-1)?.trim() ?? '';
   return /[?？][*_~]*$/u.test(prompt) ||
     /^(?:[-*+]\s+)?(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+\S/iu.test(prompt);
 }

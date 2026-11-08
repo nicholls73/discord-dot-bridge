@@ -738,6 +738,7 @@ describe('BridgeState awaited channel answers', () => {
   it.each([
     { kind: 'explicit question', text: question, expectsResponse: true, acceptsAnswer: true },
     { kind: 'explicit invitation', text: 'I need another detail.', expectsResponse: true, acceptsAnswer: true },
+    { kind: 'explicit completed-answer override', text: 'The checklist is ready.', expectsResponse: true, acceptsAnswer: true },
     { kind: 'explicit opt-out', text: question, expectsResponse: false, acceptsAnswer: false },
     { kind: 'legacy question', text: question, acceptsAnswer: true },
     { kind: 'legacy formatted question', text: `**${question}**`, acceptsAnswer: true },
@@ -746,7 +747,10 @@ describe('BridgeState awaited channel answers', () => {
     { kind: 'legacy completed answer', text: 'The checklist is ready.', acceptsAnswer: false },
     { kind: 'legacy quoted question', text: 'The checklist says "Ready?".', acceptsAnswer: false },
     { kind: 'legacy quoted block', text: '> Which checklist should I review?', acceptsAnswer: false },
+    { kind: 'legacy multi-sentence quoted block', text: '> Example prompt. Which checklist should I review?', acceptsAnswer: false },
+    { kind: 'legacy inline quoted invitation', text: 'Example: "Start here. Tell me which checklist to review?"', acceptsAnswer: false },
     { kind: 'legacy link', text: 'Checklist: https://example.test/checklist?', acceptsAnswer: false },
+    { kind: 'legacy punctuated Markdown link', text: 'Pick [the checklist](/checklist).', acceptsAnswer: false },
   ])('handles a $kind through MCP and retains a single-use wait across restart', async ({ text, expectsResponse, acceptsAnswer }) => {
     const fixture = await setup(false);
     const { bridge, env, resources } = fixture;
