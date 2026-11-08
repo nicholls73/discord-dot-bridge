@@ -105,6 +105,7 @@ interface StoredOrigin extends OriginMessage {
 interface AwaitingReply {
   eventId: string;
   messageId: string;
+  awaitingUntil: number;
   expiresAt: number;
 }
 
@@ -176,7 +177,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     origin = incoming;
     const waitingKey = awaitingReplyKey(origin);
     const waiting = await this.ctx.storage.get<AwaitingReply>(waitingKey);
-    const isWaiting = waiting && waiting.expiresAt > this.now();
+    const isWaiting = waiting && waiting.expiresAt > this.now() && waiting.awaitingUntil > this.now();
     if (validateMentionCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null &&
         !origin.replyToMessageId && !isWaiting && this.nonThreadChannels.has(origin.channelId)) {
       const previous = await this.ctx.storage.get<StoredOrigin>(`origin:${origin.eventId}`);
@@ -214,10 +215,10 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       if (!hasDiscordAccess(current, origin.guildId, origin.authorId, roleIds)) return 'rejected' as const;
       if (await transaction.get<OriginMessage>(originKey)) return false;
       const currentWait = await transaction.get<AwaitingReply>(waitingKey);
-      if (origin.awaitedReply && (!currentWait || currentWait.expiresAt <= this.now() ||
+      if (origin.awaitedReply && (!currentWait || currentWait.expiresAt <= this.now() || currentWait.awaitingUntil <= this.now() ||
           currentWait.eventId !== waiting?.eventId || currentWait.messageId !== origin.awaitedReply.messageId)) return 'rejected' as const;
       if (currentWait && (origin.awaitedReply || BigInt(origin.messageId) > BigInt(currentWait.messageId))) {
-        await transaction.delete(waitingKey);
+        await transaction.put(waitingKey, { ...currentWait, awaitingUntil: 0 });
       }
       if (!await transaction.get(RECOVERY_CURSOR_KEY)) {
         await transaction.put(RECOVERY_CURSOR_KEY, crypto.getRandomValues(new Uint8Array(32)));
@@ -358,10 +359,11 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const waiting = await transaction.get<AwaitingReply>(waitingKey);
       // A delayed receipt must not replace a newer bot reply's wait.
       if (!waiting || BigInt(waiting.messageId) < BigInt(replyMessageId)) {
-        if (expectsResponse) await transaction.put<AwaitingReply>(waitingKey, {
-          eventId: origin.eventId, messageId: replyMessageId, expiresAt: this.now() + AWAITING_REPLY_TTL_MS,
+        // Retain ordering after an answer or expiry until older reservations can no longer finish.
+        await transaction.put<AwaitingReply>(waitingKey, {
+          eventId: origin.eventId, messageId: replyMessageId, expiresAt: this.now() + ORIGIN_TTL_MS,
+          awaitingUntil: expectsResponse ? this.now() + AWAITING_REPLY_TTL_MS : 0,
         });
-        else await transaction.delete(waitingKey);
       }
     });
     await this.scheduleNextWake();
@@ -1138,7 +1140,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
 
   private async readAwaitedReply(origin: OriginMessage, waiting: AwaitingReply): Promise<Pick<OriginMessage, 'content' | 'awaitedReply'> | null> {
     if (origin.replyToMessageId || origin.mentionedUserIds.length || origin.mentionedRoleIds?.length ||
-        waiting.expiresAt <= this.now() || BigInt(origin.messageId) <= BigInt(waiting.messageId)) return null;
+        waiting.expiresAt <= this.now() || waiting.awaitingUntil <= this.now() || BigInt(origin.messageId) <= BigInt(waiting.messageId)) return null;
     try {
       const channel = await this.readDiscordResource(`/channels/${origin.channelId}`);
       if (!channel || channel.id !== origin.channelId || channel.guild_id !== origin.guildId || ![0, 5].includes(channel.type)) return null;

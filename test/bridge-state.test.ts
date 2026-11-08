@@ -858,16 +858,42 @@ describe('BridgeState awaited channel answers', () => {
     });
   });
 
-  it('removes an unanswered wait at its expiry alarm', async () => {
+  it.each(['answered', 'finished', 'expired'])('does not reopen an older question after the newer conversation is %s', async (kind) => {
+    const { bridge, source, resources, advance } = await setup(false);
+    await bridge.beginReply(source);
+    const second = { ...candidate, messageId: '66666666666666667' };
+    await bridge.recordMention(second);
+    const secondOrigin = (await bridge.getOrigin(second.messageId))!;
+    await bridge.beginReply(secondOrigin);
+    const newerReplyId = '77777777777777778';
+    await bridge.completeReply(secondOrigin, newerReplyId, kind !== 'finished');
+    resources.set(`/channels/${candidate.channelId}/messages/${newerReplyId}`, {
+      id: newerReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Which version?',
+    });
+    if (kind === 'answered') await expect(bridge.recordMention(answer)).resolves.toMatchObject({ status: 'accepted' });
+    if (kind === 'expired') {
+      advance(30 * 60_000);
+      await bridge.alarm();
+    }
+    await bridge.completeReply(source, replyId, true);
+    const next = { ...answer, messageId: '99999999999999999' };
+    resources.set(`/channels/${next.channelId}/messages/${next.messageId}`, {
+      ...resources.get(`/channels/${answer.channelId}/messages/${answer.messageId}`), id: next.messageId,
+    });
+    await expect(bridge.recordMention(next)).resolves.toMatchObject({ status: 'rejected' });
+  });
+
+  it('removes retained reply ordering state after retention expires', async () => {
     const { bridge, storage, advance } = await setup();
-    expect(storage.alarm).toBe(Date.parse(candidate.timestamp) + 30 * 60_000);
-    advance(30 * 60_000);
+    expect(storage.alarm).toBe(Date.parse(candidate.timestamp) + 7 * 24 * 60 * 60_000);
+    advance(7 * 24 * 60 * 60_000);
     await bridge.alarm();
     expect((await storage.list({ prefix: 'awaiting-reply:' })).size).toBe(0);
   });
 
   it('preserves a new question completed while an older wait is being pruned', async () => {
     const { bridge, storage, resources, advance } = await setup();
+    advance(7 * 24 * 60 * 60_000 - 60_000);
     const second = { ...candidate, messageId: '66666666666666667' };
     await bridge.recordMention(second);
     const secondOrigin = (await bridge.getOrigin(second.messageId))!;
@@ -876,7 +902,7 @@ describe('BridgeState awaited channel answers', () => {
     resources.set(`/channels/${candidate.channelId}/messages/${newerReplyId}`, {
       id: newerReplyId, channel_id: candidate.channelId, author: { id: '22222222222222222', bot: true }, content: 'Which version?',
     });
-    advance(30 * 60_000);
+    advance(60_000);
     const list = storage.list.bind(storage);
     let completion: Promise<void> | undefined;
     vi.spyOn(storage, 'list').mockImplementation(async (options) => {
