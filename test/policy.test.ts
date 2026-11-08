@@ -33,6 +33,12 @@ function candidate(overrides: Partial<GatewayMentionCandidate> = {}): GatewayMen
 }
 
 describe('runtime Discord authorization policy', () => {
+  it.each(['human mention', 'bot mention', 'role mention'])('rejects an awaited-answer record containing a %s', (kind) => {
+    const origin = toOriginMessage(candidate({ mentionedUserIds: kind === 'human mention' ? [ROLE] : kind === 'bot mention' ? [BOT] : [],
+      mentionedRoleIds: kind === 'role mention' ? [ROLE] : [] }));
+    expect(isAllowedOrigin({ ...origin, awaitedReply: { messageId: '55555555555555554', text: 'Which proposal?' } }, BOT)).toBe(false);
+  });
+
   it('accepts only a valid older awaited bot reply as an unmentioned conversation trigger', () => {
     const origin = toOriginMessage(candidate({ mentionedUserIds: [] }));
     const awaitedReply = { messageId: '55555555555555554', text: 'Which proposal?' };

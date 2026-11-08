@@ -178,19 +178,17 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     const waitingKey = awaitingReplyKey(origin);
     const waiting = await this.ctx.storage.get<AwaitingReply>(waitingKey);
     const isWaiting = waiting && waiting.expiresAt > this.now() && waiting.awaitingUntil > this.now();
+    const previous = await this.ctx.storage.get<StoredOrigin>(`origin:${origin.eventId}`);
+    const duplicate = previous && previous.expiresAt > this.now() && sameOrigin(previous, { ...origin, content: previous.content });
     if (validateMentionCandidate(origin, this.env.DISCORD_BOT_USER_ID) !== null &&
-        !origin.replyToMessageId && !isWaiting && this.nonThreadChannels.has(origin.channelId)) {
-      const previous = await this.ctx.storage.get<StoredOrigin>(`origin:${origin.eventId}`);
-      if (!previous?.awaitedReply) return 'rejected';
-    }
+        !origin.replyToMessageId && !isWaiting && !duplicate && this.nonThreadChannels.has(origin.channelId)) return 'rejected';
     const config = await this.getDiscordAuthorization();
     if (!config.guilds[origin.guildId]) return 'rejected';
     const member = await this.getCurrentMemberRoles(origin.guildId, origin.authorId);
     if (member.status !== 'member' || !hasDiscordAccess(config, origin.guildId, origin.authorId, member.roleIds)) {
       return 'rejected';
     }
-    const previous = await this.ctx.storage.get<StoredOrigin>(`origin:${origin.eventId}`);
-    if (previous && previous.expiresAt > this.now() && sameOrigin(previous, { ...origin, content: previous.content })) return 'duplicate';
+    if (duplicate) return 'duplicate';
 
     let roleIds = member.roleIds;
     if (!origin.mentionedUserIds.includes(this.env.DISCORD_BOT_USER_ID!)) {
@@ -345,7 +343,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   }
 
   async completeReply(origin: OriginMessage, replyMessageId: string, expectsResponse = false): Promise<void> {
-    if (!/^\d{17,20}$/.test(replyMessageId) || typeof expectsResponse !== 'boolean') throw new TypeError('Invalid reply receipt.');
+    if (!/^\d{17,20}$/.test(replyMessageId)) throw new TypeError('Invalid reply ID.');
+    if (typeof expectsResponse !== 'boolean') throw new TypeError('expectsResponse must be a boolean.');
     await this.ctx.storage.transaction(async (transaction) => {
       const key = `origin:${origin.eventId}`;
       const stored = await transaction.get<StoredOrigin>(key);

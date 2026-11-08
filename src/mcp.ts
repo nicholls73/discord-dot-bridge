@@ -123,7 +123,7 @@ export function createBridgeMcpHandler(dependencies: McpDependencies) {
     server.registerTool(
       'discord_reply_to_origin',
       {
-        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. A confirmed reply then accepts one plain answer from the same person in the same channel for 30 minutes, without another mention. Use false for completed answers. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
+        description: 'Reply once to an accepted Discord mention or conversation follow-up. Set expectsResponse to true when asking a question or otherwise inviting an answer, including a request for confirmation or missing information. In a guild text or announcement channel, a confirmed reply then accepts one plain answer from the same person in that channel for 30 minutes, without another mention. Threads use the existing verified Discord Reply or bot-rooted-thread triggers; expectsResponse does not enable plain answers in other threads. Use false for completed answers. Repeated calls return the saved reply ID or a reply_started status and never re-arm the wait; never retry an uncertain send. The destination is resolved server-side.',
         inputSchema: z.object({
           eventId: z.string().regex(/^\d{17,20}$/),
           text: z.string().trim().min(1).max(2000),

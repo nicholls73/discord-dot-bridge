@@ -839,6 +839,16 @@ describe('BridgeState awaited channel answers', () => {
       awaitedReply: { messageId: replyId, text: question } })).resolves.toBe('rejected');
   });
 
+  it.each(['reply ID', 'expectsResponse'])('identifies an invalid %s without completing the reserved reply', async (kind) => {
+    const { bridge, source } = await setup(false);
+    await bridge.beginReply(source);
+    await expect(bridge.completeReply(source, kind === 'reply ID' ? 'invalid' : replyId,
+      kind === 'expectsResponse' ? 'yes' as unknown as boolean : true)).rejects.toThrow(
+      kind === 'reply ID' ? 'Invalid reply ID.' : 'expectsResponse must be a boolean.',
+    );
+    await expect(bridge.beginReply(source)).resolves.toEqual({ status: 'reply_started' });
+  });
+
   it.each([false, true])('keeps the newer question when an older receipt completes late (expectsResponse: %s)', async (expectsResponse) => {
     const { bridge, source, resources } = await setup(false);
     const newerReplyId = '77777777777777778';
