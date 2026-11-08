@@ -662,11 +662,12 @@ function replyInvitesResponse(text: string): boolean {
     if (line.startsWith('>>>')) break;
     if (line.startsWith('>')) continue;
     const unquoted = line.replace(/`[^`]*`|"[^"]*"|“[^”]*”|(?<![\p{L}\p{N}])'.*?'(?![\p{L}\p{N}])/gu, '').trim();
-    const questionText = unquoted.replace(/\[[^\]]*\]\([^)]*\)|https?:\/\/\S+/giu, '');
-    if (/[?？][*_~]*(?:\s|$)/u.test(questionText)) return true;
-    if (/(?:https?:\/\/\S+|\[[^\]]*\]\([^)]*\))[.!?,;:*_~]*$/iu.test(unquoted)) continue;
-    const prompt = unquoted.split(/[.!]\s+/u).at(-1)?.trim() ?? '';
-    if (/^(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+\S/iu.test(prompt)) return true;
+    const plainText = unquoted.replace(/\[[^\]]*\]\([^)]*\)|https?:\/\/\S+/giu, '');
+    if (/[?？][*_~]*(?:\s|$)/u.test(plainText)) return true;
+    if (plainText.split(/[.!]\s+/u).some((sentence) => {
+      const invitation = sentence.trim().match(/^(?:please\s+)?(?:tell me|let me know|reply with|respond with|choose|pick|confirm|share (?:your|the|which|what))\s+(.+)/iu);
+      return invitation !== null && /[\p{L}\p{N}\p{S}]/u.test(invitation[1] ?? '');
+    })) return true;
   }
   return false;
 }
