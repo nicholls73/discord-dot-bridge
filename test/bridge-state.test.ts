@@ -749,6 +749,10 @@ describe('BridgeState awaited channel answers', () => {
     { kind: 'legacy quoted block', text: '> Which checklist should I review?', acceptsAnswer: false },
     { kind: 'legacy multi-sentence quoted block', text: '> Example prompt. Which checklist should I review?', acceptsAnswer: false },
     { kind: 'legacy inline quoted invitation', text: 'Example: "Start here. Tell me which checklist to review?"', acceptsAnswer: false },
+    { kind: 'legacy single-quoted question', text: "Example: 'Which checklist should I review?'", acceptsAnswer: false },
+    { kind: 'legacy single-quoted invitation', text: "Example: 'Start here. Tell me which checklist to review?'", acceptsAnswer: false },
+    { kind: 'legacy single-quoted contraction', text: "Example: 'It's an example. Tell me which checklist to review?'", acceptsAnswer: false },
+    { kind: 'legacy question with contractions', text: "What's the checklist you'd like me to review?", acceptsAnswer: true },
     { kind: 'legacy link', text: 'Checklist: https://example.test/checklist?', acceptsAnswer: false },
     { kind: 'legacy punctuated Markdown link', text: 'Pick [the checklist](/checklist).', acceptsAnswer: false },
   ])('handles a $kind through MCP and retains a single-use wait across restart', async ({ text, expectsResponse, acceptsAnswer }) => {
