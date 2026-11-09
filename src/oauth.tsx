@@ -3,6 +3,7 @@ import {
   OAuthProvider,
 } from '@cloudflare/workers-oauth-provider';
 import { POLICY_MANAGE_SCOPE } from './response-policy.js';
+import { TASK_MANAGE_SCOPE } from './task-reminders.js';
 import { accessAuthorized } from './access.js';
 import { canonicalIssuer } from './issuer.js';
 import {
@@ -22,9 +23,9 @@ import { Button } from './components/ui/button.js';
 import { Card, CardContent, CardFooter, CardHeader } from './components/ui/card.js';
 import adminCss from './admin.css.txt';
 
-const SUPPORTED_SCOPES = [READ_SCOPE, REPLY_SCOPE, CHANNEL_READ_SCOPE, MESSAGE_SEND_SCOPE, MESSAGE_EDIT_SCOPE, POLICY_MANAGE_SCOPE];
+const SUPPORTED_SCOPES = [READ_SCOPE, REPLY_SCOPE, CHANNEL_READ_SCOPE, MESSAGE_SEND_SCOPE, MESSAGE_EDIT_SCOPE, POLICY_MANAGE_SCOPE, TASK_MANAGE_SCOPE];
 const SUPPORTED_SCOPE_SET = new Set(SUPPORTED_SCOPES);
-const OPTIONAL_CHANNEL_SCOPES = [CHANNEL_READ_SCOPE, MESSAGE_SEND_SCOPE, MESSAGE_EDIT_SCOPE];
+const OPTIONAL_CHANNEL_SCOPES = [CHANNEL_READ_SCOPE, MESSAGE_SEND_SCOPE, MESSAGE_EDIT_SCOPE, TASK_MANAGE_SCOPE];
 const HTML_HEADERS = {
   'cache-control': 'no-store',
   'content-security-policy': "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
@@ -98,6 +99,7 @@ export async function handleAuthorization(
         [MESSAGE_SEND_SCOPE]: { title: 'Send messages', description: 'Send standalone bot messages in approved channels with safe mentions.' },
         [MESSAGE_EDIT_SCOPE]: { title: 'Edit own messages', description: 'Edit only messages authored by this bot in approved channels.' },
         [POLICY_MANAGE_SCOPE]: { title: 'Manage response policy', description: 'Edit and roll back the live response policy.' },
+        [TASK_MANAGE_SCOPE]: { title: 'Track tasks and receive private reminders', description: 'Subscribe this dot to task acknowledgements and reminders from explicitly configured approved Discord channels. Requires separately selected channel-history access.' },
       };
       const page = `<!doctype html>${renderToStaticMarkup(
         <html lang="en">
@@ -164,6 +166,11 @@ export async function handleAuthorization(
                       <CircleAlert aria-hidden="true" />
                       <AlertTitle>Policy management</AlertTitle>
                       <AlertDescription className="text-amber-950">Checking discord:policy:manage allows this client to edit and roll back the live policy. Use only for the configured owner’s private dot chat instructions, never Discord requests. This permission cannot prove the originating conversation.</AlertDescription>
+                    </Alert> : null}
+                    {requestedScopes.includes(TASK_MANAGE_SCOPE) ? <Alert className="border-amber-200 bg-amber-50 text-amber-950">
+                      <CircleAlert aria-hidden="true" />
+                      <AlertTitle>Task tracking</AlertTitle>
+                      <AlertDescription className="text-amber-950">This dot can receive private task events from channels selected by the bridge owner. The bridge only scans its explicit channel-ID allowlist and checks current approved-server and member grants. It cannot prove that a tool call came from a private chat.</AlertDescription>
                     </Alert> : null}
                     <details className="disclosure text-sm">
                       <summary className="w-fit font-medium">How access works</summary>

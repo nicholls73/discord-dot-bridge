@@ -8,7 +8,30 @@ import {
   type EventSubscription,
   type EventAuthorizationReference,
   type EventSubscriptionIdentity,
+  type BridgeEvent,
 } from './events.js';
+import {
+  TASK_CAPTURED_EVENT_NAME,
+  TASK_MANAGE_SCOPE,
+  TASK_REMINDER_EVENT_NAME,
+  TASK_SWEEP_INTERVAL_MS,
+  TASK_INITIAL_REMINDER_MS,
+  TASK_LOOKBACK_MS,
+  TASK_CLOSED_RETENTION_MS,
+  advanceReminder,
+  applySourceEdit,
+  applyTaskFollowup,
+  canTrackAnotherTask,
+  detectTaskCandidate,
+  isTaskFollowup,
+  parseTaskReminderChannelIds,
+  shouldSendReminder,
+  taskKey,
+  toTaskEvent,
+  type TaskReminderMessage,
+  type TrackedTask,
+} from './task-reminders.js';
+import { DiscordRestMessenger, type DiscordChannelMessage } from './discord.js';
 import { DiscordGatewayProtocol, type GatewayCommand, type GatewaySession } from './gateway.js';
 import { fetchWithoutRedirect, RedirectResponseError } from './fetch-no-redirect.js';
 import { postSignedEvent, retryDelayMs, validateCallbackUrl } from './mcp-events.js';
@@ -53,10 +76,20 @@ import { logSubscriptionDiagnostic, type SubscriptionPhase } from './subscriptio
 
 interface PendingDelivery {
   subscriptionId: string;
-  event: ReturnType<typeof toMentionEvent>;
+  event: BridgeEvent;
   attempts: number;
   nextAttemptAt: number;
 }
+
+interface TaskChannelScan {
+  before: string;
+  highWaterId: string;
+  cursor: string | null;
+  cutoffAt: number;
+  messages: TaskReminderMessage[];
+}
+
+export type TaskUpdateResult = { ok: true; task: TrackedTask } | { ok: false; reason: 'conflict' | 'not_found'; currentRevision: number };
 
 export interface AdminRuntimeStatus {
   state: 'idle' | 'connecting' | 'connected' | 'unavailable';
@@ -89,8 +122,17 @@ const AWAITING_REPLY_TTL_MS = 30 * 60_000;
 const DISCORD_GUILD_NAMES_KEY = 'discord:guild-names';
 const DISCORD_OAUTH_STATE_TTL_MS = 10 * 60_000;
 const DISCORD_GUILD_CANDIDATE_TTL_MS = 5 * 60_000;
+const TASK_SCAN_AT_KEY = 'task-reminders:next-scan-at';
+const TASK_SCAN_LEASE_KEY = 'task-reminders:scan-lease';
+const TASK_CURSOR_PREFIX = 'task-reminders:cursor:';
+const TASK_SCAN_PREFIX = 'task-reminders:scan:';
+const TASK_PREFIX = 'task:';
 const MAX_DELIVERY_ATTEMPTS = 6;
 const MAX_DELIVERIES_PER_ALARM = 20;
+const TASK_PAGE_SIZE = 100;
+const TASK_MAX_PAGES_PER_SCAN = 5;
+const TASK_RETRY_DELAY_MS = 5 * 60_000;
+const TASK_SCAN_CONTINUE_MS = 60_000;
 const RECOVERY_SCAN_BUDGET_MS = 5_000;
 const ORIGIN_TTL_MS = 7 * 24 * 60 * 60_000;
 const MEMBER_LOOKUP_MAX_RETRIES = 1;
@@ -474,7 +516,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     this.assertAdminOwner(ownerEmail);
     if (!Number.isFinite(now)) throw new TypeError('Runtime status time is invalid.');
     const subscriptions = await this.ctx.storage.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
-    const unexpired = [...subscriptions.values()].filter((item) => Date.parse(item.refreshBefore) > now);
+    const unexpired = [...subscriptions.values()].filter((item) => item.name === MENTION_EVENT_NAME && Date.parse(item.refreshBefore) > now);
     if (!unexpired.length) return { state: 'idle', activeSubscriptions: 0 };
     if (!this.env.OAUTH_KV || !canonicalIssuer(this.env.MCP_ISSUER_URL) || !this.env.ACCESS_OWNER_EMAIL?.trim()) {
       return { state: 'unavailable', activeSubscriptions: null };
@@ -585,6 +627,44 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       }
       return value;
     });
+  }
+
+  async updateTask(
+    ownerEmail: string,
+    taskId: string,
+    expectedRevision: number,
+    action: 'complete' | 'cancel' | 'snooze',
+    snoozeHours?: number,
+  ): Promise<TaskUpdateResult> {
+    this.assertAdminOwner(ownerEmail);
+    if (!/^\d{17,20}:\d{17,20}$/.test(taskId) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1 ||
+        !['complete', 'cancel', 'snooze'].includes(action) ||
+        (action === 'snooze' ? !Number.isInteger(snoozeHours) || (snoozeHours ?? 0) < 1 || (snoozeHours ?? 0) > 720 : snoozeHours !== undefined)) {
+      throw new TypeError('Task update is invalid.');
+    }
+    const link = await this.getLinkedDiscordAccount(ownerEmail);
+    if (!link) return { ok: false, reason: 'not_found', currentRevision: 0 };
+    const result = await this.ctx.storage.transaction(async (transaction): Promise<TaskUpdateResult> => {
+      const key = taskKey(taskId);
+      const task = await transaction.get<TrackedTask>(key);
+      if (!task || task.ownerId !== link.userId) return { ok: false, reason: 'not_found', currentRevision: 0 };
+      if (task.revision !== expectedRevision) return { ok: false, reason: 'conflict', currentRevision: task.revision };
+      const updated: TrackedTask = {
+        ...task,
+        revision: task.revision + 1,
+        status: action === 'complete' ? 'completed' : action === 'cancel' ? 'cancelled' : 'open',
+        lastActivityAt: this.now(),
+        ...(action === 'snooze' ? { nextReminderAt: this.now() + (snoozeHours ?? 1) * 60 * 60_000 } : {}),
+      };
+      await transaction.put(key, updated);
+      const deliveries = await transaction.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
+      for (const [deliveryKey, delivery] of deliveries) {
+        if ('task_id' in delivery.event.data && delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
+      }
+      return { ok: true, task: updated };
+    });
+    await this.scheduleNextWake();
+    return result;
   }
 
   async saveLinkedDiscordAccount(ownerEmail: string, link: LinkedDiscordAccount): Promise<void> {
@@ -797,10 +877,11 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       });
       subscriptionStored = true;
       logSubscriptionDiagnostic(phase, 'succeeded', { subscriptionStored });
-      await this.ctx.storage.delete('gateway:terminal-close-code');
+      if (input.name === MENTION_EVENT_NAME) await this.ctx.storage.delete('gateway:terminal-close-code');
       phase = 'gateway';
       logSubscriptionDiagnostic(phase, 'started', { subscriptionStored });
-      await this.ensureGateway();
+      if (input.name === MENTION_EVENT_NAME) await this.ensureGateway();
+      else await this.ctx.storage.put(TASK_SCAN_AT_KEY, Math.min(await this.ctx.storage.get<number>(TASK_SCAN_AT_KEY) ?? Number.POSITIVE_INFINITY, now + 1_000));
       logSubscriptionDiagnostic(phase, 'returned', { subscriptionStored });
       phase = 'storage';
       await this.processDueDeliveries();
@@ -822,7 +903,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const outbox = await transaction.list<PendingDelivery>({ prefix: `${DELIVERY_PREFIX}${identity.id}:` });
       for (const deliveryKey of outbox.keys()) await transaction.delete(deliveryKey);
     });
-    await this.ensureGateway();
+    if (identity.name === MENTION_EVENT_NAME) await this.ensureGateway();
     await this.scheduleNextWake();
   }
 
@@ -856,6 +937,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       await this.applyGatewayCommands(this.gatewayProtocol.alarm());
     }
     this.startTypingWork();
+    await this.runTaskReminderSweepIfDue();
     await this.processDueDeliveries();
     await this.scheduleNextWake();
   }
@@ -942,7 +1024,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
 
   private async ensureGateway(): Promise<void> {
     const subscriptions = await this.ctx.storage.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
-    if (![...subscriptions.values()].some((subscription) => Date.parse(subscription.refreshBefore) > this.now())) {
+    if (![...subscriptions.values()].some((subscription) => subscription.name === MENTION_EVENT_NAME &&
+        Date.parse(subscription.refreshBefore) > this.now())) {
       await this.stopGateway();
       return;
     }
@@ -1232,6 +1315,359 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     await this.scheduleNextWake();
   }
 
+  private taskReminderChannels(): string[] {
+    try { return parseTaskReminderChannelIds(this.env.TASK_REMINDER_CHANNEL_IDS); }
+    catch { return []; }
+  }
+
+  private async runTaskReminderSweepIfDue(): Promise<void> {
+    const channels = this.taskReminderChannels();
+    const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
+    const dueAt = await this.ctx.storage.get<number>(TASK_SCAN_AT_KEY);
+    if (!channels.length || !ownerEmail) {
+      await this.ctx.storage.delete(TASK_SCAN_AT_KEY);
+      return;
+    }
+    if (typeof dueAt === 'number' && dueAt > this.now()) return;
+
+    const leaseId = crypto.randomUUID();
+    const acquired = await this.ctx.storage.transaction(async (transaction) => {
+      const current = await transaction.get<{ id?: string; until?: number }>(TASK_SCAN_LEASE_KEY);
+      if (typeof current?.until === 'number' && current.until > this.now()) return false;
+      await transaction.put(TASK_SCAN_LEASE_KEY, { id: leaseId, until: this.now() + 10 * 60_000 });
+      return true;
+    });
+    if (!acquired) return;
+
+    let nextScanAt = this.now() + TASK_RETRY_DELAY_MS;
+    try {
+      const link = await this.getLinkedDiscordAccount(ownerEmail);
+      const taskSubscriptions = await this.authorizedTaskSubscriptions();
+      const token = this.env.DISCORD_BOT_TOKEN?.trim();
+      const botUserId = this.env.DISCORD_BOT_USER_ID?.trim();
+      if (!link || !taskSubscriptions.length || !token || !botUserId || !isDiscordSnowflake(botUserId)) return;
+      const messenger = new DiscordRestMessenger(token, this.discordFetch, botUserId);
+      let allChannelsScanned = true;
+      for (const channelId of channels) {
+        try {
+          const complete = await this.scanTaskChannel(channelId, link.userId, ownerEmail, messenger, taskSubscriptions);
+          allChannelsScanned = allChannelsScanned && complete;
+        } catch {
+          allChannelsScanned = false;
+        }
+      }
+      if (!allChannelsScanned) {
+        nextScanAt = this.now() + TASK_SCAN_CONTINUE_MS;
+        return;
+      }
+      await this.pruneClosedTasks();
+      await this.queueDueTaskReminders(taskSubscriptions);
+      nextScanAt = this.now() + TASK_SWEEP_INTERVAL_MS;
+    } catch {
+      // Keep the prior cursor; a failed read must not skip history or send a stale reminder.
+    } finally {
+      await this.ctx.storage.transaction(async (transaction) => {
+        const lease = await transaction.get<{ id?: string }>(TASK_SCAN_LEASE_KEY);
+        if (lease?.id === leaseId) await transaction.delete(TASK_SCAN_LEASE_KEY);
+        await transaction.put(TASK_SCAN_AT_KEY, nextScanAt);
+      });
+    }
+  }
+
+  private async authorizedTaskSubscriptions(): Promise<EventSubscription[]> {
+    const subscriptions = await this.ctx.storage.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
+    const active: EventSubscription[] = [];
+    for (const subscription of subscriptions.values()) {
+      if ((subscription.name !== TASK_CAPTURED_EVENT_NAME && subscription.name !== TASK_REMINDER_EVENT_NAME) ||
+          Date.parse(subscription.refreshBefore) <= this.now()) continue;
+      try {
+        if (await this.isSubscriptionAuthorized(subscription)) active.push(subscription);
+      } catch {
+        // A transient OAuth storage failure defers scanning rather than widening access.
+        throw new Error('Task event authorization is unavailable.');
+      }
+    }
+    return active;
+  }
+
+  private async scanTaskChannel(
+    channelId: string,
+    ownerId: string,
+    ownerEmail: string,
+    messenger: DiscordRestMessenger,
+    subscriptions: EventSubscription[],
+  ): Promise<boolean> {
+    const scanKey = `${TASK_SCAN_PREFIX}${channelId}`;
+    const cursorKey = `${TASK_CURSOR_PREFIX}${channelId}`;
+    const cursor = await this.ctx.storage.get<string>(cursorKey) ?? null;
+    let scan = await this.ctx.storage.get<TaskChannelScan>(scanKey);
+    let pageCount = 0;
+    const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
+
+    if (!scan) {
+      const page = await messenger.listChannelMessages(channelId, undefined, TASK_PAGE_SIZE, authorizeGuild);
+      if (!page.messages.length) return true;
+      const messages = toTaskMessages(page.guildId, page.messages);
+      const highWaterId = messages.reduce((max, message) => BigInt(message.id) > BigInt(max) ? message.id : max, messages[0]!.id);
+      const cutoffAt = cursor ? Number.POSITIVE_INFINITY : this.now() - TASK_LOOKBACK_MS;
+      scan = {
+        before: page.nextBefore ?? messages.at(-1)!.id,
+        highWaterId,
+        cursor,
+        cutoffAt,
+        messages: eligibleTaskMessages(messages, cursor, cutoffAt),
+      };
+      pageCount = 1;
+      if (pageBoundaryReached(messages, cursor, cutoffAt, page.nextBefore)) {
+        await this.finishTaskChannelScan(scanKey, cursorKey, scan, ownerId, ownerEmail, subscriptions);
+        return true;
+      }
+      await this.ctx.storage.put(scanKey, scan);
+    }
+
+    while (pageCount < TASK_MAX_PAGES_PER_SCAN) {
+      const page = await messenger.listChannelMessages(channelId, scan.before, TASK_PAGE_SIZE, authorizeGuild);
+      pageCount += 1;
+      const messages = toTaskMessages(page.guildId, page.messages);
+      scan.messages.push(...eligibleTaskMessages(messages, scan.cursor, scan.cutoffAt));
+      if (pageBoundaryReached(messages, scan.cursor, scan.cutoffAt, page.nextBefore)) {
+        await this.finishTaskChannelScan(scanKey, cursorKey, scan, ownerId, ownerEmail, subscriptions);
+        return true;
+      }
+      if (!page.nextBefore || !messages.length) {
+        await this.finishTaskChannelScan(scanKey, cursorKey, scan, ownerId, ownerEmail, subscriptions);
+        return true;
+      }
+      scan.before = page.nextBefore;
+    }
+    await this.ctx.storage.put(scanKey, scan);
+    return false;
+  }
+
+  private async finishTaskChannelScan(
+    scanKey: string,
+    cursorKey: string,
+    scan: TaskChannelScan,
+    ownerId: string,
+    ownerEmail: string,
+    subscriptions: EventSubscription[],
+  ): Promise<void> {
+    const authorizedMessages = await this.authorizedTaskMessages(scan.messages, ownerEmail);
+    authorizedMessages.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
+    await this.processTaskMessages(authorizedMessages, ownerId, subscriptions);
+    await this.ctx.storage.put(cursorKey, scan.highWaterId);
+    await this.ctx.storage.delete(scanKey);
+  }
+
+  private async authorizedTaskMessages(messages: TaskReminderMessage[], ownerEmail: string): Promise<TaskReminderMessage[]> {
+    const allowed: TaskReminderMessage[] = [];
+    const memberAccess = new Map<string, Promise<MemberAuthorizationResult>>();
+    for (const message of messages) {
+      if (message.authorIsBot) {
+        if (message.authorId === this.env.DISCORD_BOT_USER_ID) allowed.push(message);
+        continue;
+      }
+      const memberKey = `${message.guildId}:${message.authorId}`;
+      let accessRequest = memberAccess.get(memberKey);
+      if (!accessRequest) {
+        accessRequest = this.isAuthorizedMember(message.guildId, message.authorId);
+        memberAccess.set(memberKey, accessRequest);
+      }
+      const access = await accessRequest;
+      if (access.status === 'unavailable') throw new Error('Discord member authorization is unavailable.');
+      if (access.status === 'authorized') allowed.push(message);
+    }
+    return allowed;
+  }
+
+  private async processTaskMessages(
+    messages: TaskReminderMessage[],
+    ownerId: string,
+    subscriptions: EventSubscription[],
+  ): Promise<void> {
+    let tasks = await this.ctx.storage.list<TrackedTask>({ prefix: TASK_PREFIX });
+    let taskCount = tasks.size;
+    for (const message of messages) {
+      for (const [key, task] of tasks) {
+        if (task.status !== 'open' || task.guildId !== message.guildId) continue;
+        let updated = applySourceEdit(task, message);
+        updated = applyTaskFollowup(updated, message, ownerId);
+        if (updated.revision === task.revision) continue;
+        const saved = await this.ctx.storage.transaction(async (transaction) => {
+          const current = await transaction.get<TrackedTask>(key);
+          if (!current || current.revision !== task.revision) return current ?? task;
+          await transaction.put(key, updated);
+          return updated;
+        });
+        tasks.set(key, saved);
+      }
+
+      const existingTaskAcknowledgement = message.authorId === ownerId && [...tasks.values()].some((task) =>
+        task.status === 'open' && task.ownerId === ownerId && isTaskFollowup(task, message));
+      const candidate = detectTaskCandidate(message, ownerId);
+      if (candidate?.ownership === 'commitment' && existingTaskAcknowledgement) continue;
+      if (!candidate || taskCount >= 500) continue;
+      const created: TrackedTask = {
+        ...candidate,
+        revision: 1,
+        status: 'open',
+        createdAt: this.now(),
+        lastActivityAt: Date.parse(message.timestamp),
+        nextReminderAt: this.now() + TASK_INITIAL_REMINDER_MS,
+        remindersSent: 0,
+        ...(candidate.threadId ? { threadCursor: candidate.threadId } : {}),
+      };
+      const stored = await this.ctx.storage.transaction(async (transaction) => {
+        const key = taskKey(created.id);
+        if (await transaction.get<TrackedTask>(key)) return false;
+        const currentTasks = await transaction.list<TrackedTask>({ prefix: TASK_PREFIX });
+        if (!canTrackAnotherTask(currentTasks.size)) return false;
+        await transaction.put(key, created);
+        const currentSubscriptions = await transaction.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
+        for (const subscription of subscriptions) {
+          const current = currentSubscriptions.get(`${SUBSCRIPTION_PREFIX}${subscription.id}`);
+          if (!current || current.name !== TASK_CAPTURED_EVENT_NAME || Date.parse(current.refreshBefore) <= this.now()) continue;
+          const event = toTaskEvent(created, TASK_CAPTURED_EVENT_NAME, this.now());
+          await transaction.put<PendingDelivery>(deliveryKey(subscription.id, event.eventId), {
+            subscriptionId: subscription.id, event, attempts: 0, nextAttemptAt: this.now() + 1_000,
+          });
+        }
+        return true;
+      });
+      if (stored) {
+        taskCount += 1;
+        tasks.set(taskKey(created.id), created);
+      }
+    }
+  }
+
+  private async queueDueTaskReminders(subscriptions: EventSubscription[]): Promise<void> {
+    const channels = new Set(this.taskReminderChannels());
+    const reminderSubscriptions = subscriptions.filter((subscription) => subscription.name === TASK_REMINDER_EVENT_NAME);
+    if (!reminderSubscriptions.length) return;
+    const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
+    const link = ownerEmail ? await this.getLinkedDiscordAccount(ownerEmail) : null;
+    const token = this.env.DISCORD_BOT_TOKEN?.trim();
+    const botUserId = this.env.DISCORD_BOT_USER_ID?.trim();
+    if (!ownerEmail || !link || !token || !botUserId) return;
+    const messenger = new DiscordRestMessenger(token, this.discordFetch, botUserId);
+    const tasks = await this.ctx.storage.list<TrackedTask>({ prefix: TASK_PREFIX });
+    for (const [key, storedTask] of tasks) {
+      let task = storedTask;
+      if (!channels.has(task.channelId) || task.ownerId !== link.userId || !shouldSendReminder(task, this.now())) continue;
+      if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) continue;
+      const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
+      const source = await messenger.getChannelMessage(task.channelId, task.messageId, authorizeGuild);
+      if (!source) {
+        await this.saveTaskUpdate(key, task.revision, { ...task, revision: task.revision + 1, status: 'cancelled', lastActivityAt: this.now() });
+        continue;
+      }
+      const sourceMessage: TaskReminderMessage = {
+        ...source, guildId: task.guildId, mentionedUserIds: source.mentionedUserIds ?? [],
+      };
+      const afterEdit = applySourceEdit(task, sourceMessage);
+      if (afterEdit.revision !== task.revision) {
+        task = await this.saveTaskUpdate(key, task.revision, afterEdit) ?? task;
+        if (task.status !== 'open' || task.revision !== storedTask.revision) continue;
+      }
+      if (task.threadId) {
+        const threadScanComplete = await this.checkTaskThread(task, key, link.userId, ownerEmail, messenger, authorizeGuild);
+        if (!threadScanComplete) continue;
+        task = await this.ctx.storage.get<TrackedTask>(key) ?? task;
+        if (task.status !== 'open') continue;
+      }
+      if (!shouldSendReminder(task, this.now())) continue;
+      const updated = advanceReminder(task, this.now());
+      await this.ctx.storage.transaction(async (transaction) => {
+        const current = await transaction.get<TrackedTask>(key);
+        if (!current || current.revision !== task.revision || !shouldSendReminder(current, this.now())) return;
+        await transaction.put(key, updated);
+        const currentSubscriptions = await transaction.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
+        for (const subscription of reminderSubscriptions) {
+          const latest = currentSubscriptions.get(`${SUBSCRIPTION_PREFIX}${subscription.id}`);
+          if (!latest || latest.name !== TASK_REMINDER_EVENT_NAME || Date.parse(latest.refreshBefore) <= this.now()) continue;
+          const event = toTaskEvent(updated, TASK_REMINDER_EVENT_NAME, this.now());
+          await transaction.put<PendingDelivery>(deliveryKey(subscription.id, event.eventId), {
+            subscriptionId: subscription.id, event, attempts: 0, nextAttemptAt: this.now() + 1_000,
+          });
+        }
+      });
+    }
+  }
+
+  private async pruneClosedTasks(): Promise<void> {
+    const tasks = await this.ctx.storage.list<TrackedTask>({ prefix: TASK_PREFIX });
+    for (const [key, task] of tasks) {
+      if (task.status === 'open' || this.now() - task.lastActivityAt < TASK_CLOSED_RETENTION_MS) continue;
+      await this.ctx.storage.transaction(async (transaction) => {
+        const latest = await transaction.get<TrackedTask>(key);
+        if (!latest || latest.status === 'open' || this.now() - latest.lastActivityAt < TASK_CLOSED_RETENTION_MS) return;
+        await transaction.delete(key);
+        const deliveries = await transaction.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
+        for (const [deliveryKey, delivery] of deliveries) {
+          if ('task_id' in delivery.event.data && delivery.event.data.task_id === task.id) await transaction.delete(deliveryKey);
+        }
+      });
+    }
+  }
+
+  private async saveTaskUpdate(key: string, expectedRevision: number, updated: TrackedTask): Promise<TrackedTask | null> {
+    return this.ctx.storage.transaction(async (transaction) => {
+      const current = await transaction.get<TrackedTask>(key);
+      if (!current || current.revision !== expectedRevision) return current ?? null;
+      await transaction.put(key, updated);
+      return updated;
+    });
+  }
+
+  private async checkTaskThread(
+    initialTask: TrackedTask,
+    key: string,
+    ownerId: string,
+    ownerEmail: string,
+    messenger: DiscordRestMessenger,
+    authorizeGuild: (guildId: string) => Promise<boolean>,
+  ): Promise<boolean> {
+    let task = await this.ctx.storage.get<TrackedTask>(key) ?? initialTask;
+    let scan = task.threadScan;
+    let pageCount = 0;
+    const cursor = task.threadCursor ?? task.messageId;
+    while (pageCount < TASK_MAX_PAGES_PER_SCAN) {
+      const page = await messenger.listChannelMessages(task.threadId!, scan?.before, TASK_PAGE_SIZE, authorizeGuild, 'thread');
+      pageCount += 1;
+      const messages = toTaskMessages(page.guildId, page.messages);
+      const highWaterId = scan?.highWaterId ?? messages.reduce(
+        (max, message) => BigInt(message.id) > BigInt(max) ? message.id : max, cursor,
+      );
+      const newMessages = messages.filter((message) => BigInt(message.id) > BigInt(cursor));
+      const buffered = [...(scan?.messages ?? []), ...newMessages];
+      const reachedCursor = messages.some((message) => BigInt(message.id) <= BigInt(cursor));
+      const complete = reachedCursor || !page.nextBefore || !messages.length;
+      if (complete) {
+        const authorized = await this.authorizedTaskMessages(buffered, ownerEmail);
+        authorized.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
+        for (const message of authorized) {
+          task = await this.ctx.storage.get<TrackedTask>(key) ?? task;
+          const updated = applyTaskFollowup(task, message, ownerId);
+          if (updated.revision !== task.revision) {
+            task = await this.saveTaskUpdate(key, task.revision, updated) ?? task;
+            if (task.status !== 'open') break;
+          }
+        }
+        task = await this.ctx.storage.get<TrackedTask>(key) ?? task;
+        const latestId = messages.reduce((max, message) => BigInt(message.id) > BigInt(max) ? message.id : max, scan?.highWaterId ?? cursor);
+        const { threadScan: _threadScan, ...withoutScan } = task;
+        await this.saveTaskUpdate(key, task.revision, { ...withoutScan, threadCursor: latestId });
+        return true;
+      }
+      if (!page.nextBefore) return true;
+      scan = { before: page.nextBefore, highWaterId, messages: buffered };
+      const updatedTask = { ...task, threadScan: scan };
+      task = await this.saveTaskUpdate(key, task.revision, updatedTask) ?? updatedTask;
+    }
+    return false;
+  }
+
   private async processDueDeliveries(): Promise<void> {
     const entries = await this.ctx.storage.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
     const due = [...entries.entries()]
@@ -1240,8 +1676,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       .slice(0, MAX_DELIVERIES_PER_ALARM);
     for (const [key, delivery] of due) {
       const subscription = await this.ctx.storage.get<EventSubscription>(`${SUBSCRIPTION_PREFIX}${delivery.subscriptionId}`);
-      const stored = await this.ctx.storage.get<StoredOrigin>(`origin:${delivery.event.eventId}`);
-      if (!subscription || !stored || stored.expiresAt <= this.now() || Date.parse(subscription.refreshBefore) <= this.now()) {
+      const mentionEvent = delivery.event.name === MENTION_EVENT_NAME;
+      const stored = mentionEvent ? await this.ctx.storage.get<StoredOrigin>(`origin:${delivery.event.eventId}`) : undefined;
+      const taskId = 'task_id' in delivery.event.data ? delivery.event.data.task_id : undefined;
+      const task = taskId ? await this.ctx.storage.get<TrackedTask>(taskKey(taskId)) : undefined;
+      if (!subscription || Date.parse(subscription.refreshBefore) <= this.now() ||
+          mentionEvent && (!stored || stored.expiresAt <= this.now()) || !mentionEvent && !task) {
         await this.ctx.storage.delete(key);
         continue;
       }
@@ -1256,15 +1696,35 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         await this.removeSubscription(subscription);
         continue;
       }
-      const { expiresAt: _expiresAt, recipients: _recipients, reply: _reply, ...origin } = stored;
-      const authorization = await this.checkOriginAuthorization(origin);
-      if (authorization === 'revoked') {
-        await this.removeOriginAndDeliveries(origin.eventId);
-        continue;
-      }
-      if (authorization === 'unavailable') {
-        await this.retryDelivery(key, delivery);
-        continue;
+      if (mentionEvent) {
+        const { expiresAt: _expiresAt, recipients: _recipients, reply: _reply, ...origin } = stored!;
+        const authorization = await this.checkOriginAuthorization(origin);
+        if (authorization === 'revoked') {
+          await this.removeOriginAndDeliveries(origin.eventId);
+          continue;
+        }
+        if (authorization === 'unavailable') {
+          await this.retryDelivery(key, delivery);
+          continue;
+        }
+      } else {
+        const eventRevision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
+        const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
+        const link = ownerEmail ? await this.getLinkedDiscordAccount(ownerEmail) : null;
+        if (!task || !ownerEmail || !link || task.ownerId !== link.userId || task.status !== 'open' ||
+            task.revision !== eventRevision || !this.taskReminderChannels().includes(task.channelId)) {
+          await this.ctx.storage.delete(key);
+          continue;
+        }
+        try {
+          if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) {
+            await this.ctx.storage.delete(key);
+            continue;
+          }
+        } catch {
+          await this.retryDelivery(key, delivery);
+          continue;
+        }
       }
       let status = 0;
       try {
@@ -1287,8 +1747,10 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     const authorization = subscription.authorization;
     const issuer = canonicalIssuer(this.env.MCP_ISSUER_URL);
     const kv = this.env.OAUTH_KV;
+    const isMentionSubscription = subscription.name === MENTION_EVENT_NAME;
+    const isTaskSubscription = subscription.name === TASK_CAPTURED_EVENT_NAME || subscription.name === TASK_REMINDER_EVENT_NAME;
     if (!configuredOwner || subscription.principal.trim().toLowerCase() !== configuredOwner ||
-        subscription.name !== MENTION_EVENT_NAME || !authorization || !issuer || !kv ||
+        (!isMentionSubscription && (!isTaskSubscription || !this.taskReminderChannels().length)) || !authorization || !issuer || !kv ||
         authorization.audience !== `${issuer}/mcp`) return false;
     const token = await kv.get<OAuthTokenRecord>(
       `token:${subscription.principal}:${authorization.grantId}:${authorization.tokenId}`,
@@ -1300,7 +1762,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     const audience = token.audience;
     if (!(audience === authorization.audience || Array.isArray(audience) && audience.includes(authorization.audience))) return false;
     const scopes = token.scope ?? token.grant?.scope ?? [];
-    return scopes.includes('discord:read') && scopes.includes('discord:reply');
+    return scopes.includes('discord:read') && scopes.includes('discord:reply') &&
+      (isMentionSubscription || scopes.includes('discord:channel:read') && scopes.includes(TASK_MANAGE_SCOPE));
   }
 
   private async retryDelivery(key: string, delivery: PendingDelivery): Promise<void> {
@@ -1481,6 +1944,15 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         Math.max(this.now() + 250, channel.nextAttemptAt, globalBackoff),
         ...Object.values(channel.events).filter((deadline) => deadline > this.now()),
       ]);
+      const subscriptions = await transaction.list<EventSubscription>({ prefix: SUBSCRIPTION_PREFIX });
+      const taskMonitoringEnabled = this.taskReminderChannels().length > 0 && [...subscriptions.values()].some((subscription) =>
+        (subscription.name === TASK_CAPTURED_EVENT_NAME || subscription.name === TASK_REMINDER_EVENT_NAME) &&
+        Date.parse(subscription.refreshBefore) > this.now());
+      const taskLease = await transaction.get<{ until?: number }>(TASK_SCAN_LEASE_KEY);
+      const taskScanAt = taskMonitoringEnabled
+        ? Math.max(await transaction.get<number>(TASK_SCAN_AT_KEY) ?? this.now() + TASK_SCAN_CONTINUE_MS,
+          typeof taskLease?.until === 'number' && taskLease.until > this.now() ? taskLease.until : this.now())
+        : Number.POSITIVE_INFINITY;
       const next = Math.min(
         typeof gatewayAlarmAt === 'number' ? gatewayAlarmAt : Number.POSITIVE_INFINITY,
         ...typingTimes,
@@ -1489,6 +1961,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         ...[...deliveries.values()].map((delivery) => delivery.nextAttemptAt),
         ...originExpiryTimes,
         ...[...awaitingReplies.values()].map((waiting) => waiting.expiresAt),
+        taskScanAt,
       );
       if (Number.isFinite(next)) await transaction.setAlarm(Math.max(this.now() + 1, next));
       else await transaction.deleteAlarm();
@@ -1553,6 +2026,31 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
 
 function deliveryKey(subscriptionId: string, eventId: string): string {
   return `${DELIVERY_PREFIX}${subscriptionId}:${eventId}`;
+}
+
+function toTaskMessages(guildId: string, messages: DiscordChannelMessage[]): TaskReminderMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    guildId,
+    mentionedUserIds: message.mentionedUserIds ?? [],
+  }));
+}
+
+function eligibleTaskMessages(messages: TaskReminderMessage[], cursor: string | null, cutoffAt: number): TaskReminderMessage[] {
+  return messages.filter((message) => cursor
+    ? BigInt(message.id) > BigInt(cursor)
+    : Date.parse(message.timestamp) >= cutoffAt);
+}
+
+function pageBoundaryReached(
+  messages: TaskReminderMessage[],
+  cursor: string | null,
+  cutoffAt: number,
+  nextBefore: string | null,
+): boolean {
+  return !messages.length || (cursor
+    ? messages.some((message) => BigInt(message.id) <= BigInt(cursor))
+    : messages.some((message) => Date.parse(message.timestamp) <= cutoffAt)) || nextBefore === null;
 }
 
 async function memberLookupRetryDelayMs(response: Response): Promise<number | null> {

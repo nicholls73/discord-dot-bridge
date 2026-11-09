@@ -60,6 +60,17 @@ variable "discord_bot_user_id" {
   }
 }
 
+variable "task_reminder_channel_ids" {
+  type        = list(string)
+  default     = []
+  description = "Explicit approved Discord channel IDs eligible for local task-reminder monitoring. Empty disables the feature."
+
+  validation {
+    condition     = length(var.task_reminder_channel_ids) <= 10 && length(distinct(var.task_reminder_channel_ids)) == length(var.task_reminder_channel_ids) && alltrue([for id in var.task_reminder_channel_ids : can(regex("^[0-9]{17,20}$", id))])
+    error_message = "Use at most 10 unique Discord channel IDs, each 17 to 20 digits."
+  }
+}
+
 variable "discord_bot_token" {
   description = "Discord bot token. Terraform stores this sensitive Worker secret binding in state."
   type        = string

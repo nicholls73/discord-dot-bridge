@@ -105,6 +105,7 @@ describe('Terraform Worker upload artifact', () => {
         { scope: 'discord:channel:read', checked: false },
         { scope: 'discord:message:send', checked: false },
         { scope: 'discord:message:edit', checked: false },
+        { scope: 'discord:task:manage', checked: false },
       ]);
       expect(consentHtml).toContain('These choices do not widen already-issued tokens');
       expect(outboundRequests.length).toBeGreaterThan(0);

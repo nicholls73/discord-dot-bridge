@@ -17,6 +17,8 @@ import type {
 } from '../src/origin-store.js';
 import type { OriginMessage } from '../src/policy.js';
 import type { EventSubscriptionInput } from '../src/mcp-events.js';
+import { TASK_MANAGE_SCOPE } from '../src/task-reminders.js';
+import type { TaskControls } from '../src/mcp.js';
 
 const policyEnv = {
   ACCESS_OWNER_EMAIL: POLICY_OWNER,
@@ -51,6 +53,7 @@ async function connectedClient(scopes: string[], overrides: {
   recovery?: MentionRecoveryStore;
   channelAccess?: ChannelAccessStore;
   outbound?: StandaloneMessageStore;
+  tasks?: TaskControls;
   unconfigured?: boolean;
 } = {}) {
   const storedOrigin = overrides.origin === undefined ? origin : overrides.origin;
@@ -109,7 +112,7 @@ async function connectedClient(scopes: string[], overrides: {
   };
   const authorization = { grantId: 'grant', tokenId: 'a'.repeat(64), clientId: 'test-client', audience: 'https://discord-dot.test/mcp' };
   const policy = (overrides.unconfigured ? policyFixture() : seededPolicyFixture()).controls;
-  const handler = createBridgeMcpHandler({ policy, origins, recovery, channelAccess, outbound, listChannels: overrides.listChannels ?? (async () => []), discord: messenger, events, eventsAuthorization: authorization, eventsEnabled: true, env: policyEnv });
+  const handler = createBridgeMcpHandler({ policy, origins, recovery, channelAccess, outbound, tasks: overrides.tasks, listChannels: overrides.listChannels ?? (async () => []), discord: messenger, events, eventsAuthorization: authorization, eventsEnabled: true, env: policyEnv });
   const authInfo: AuthInfo = {
     token: 'unit-test-token',
     clientId: 'test-client',
@@ -1143,6 +1146,36 @@ describe('unconfigured MCP policy', () => {
       expect(stale.isError).toBe(true);
       expect(JSON.parse((stale.content[0] as { text: string }).text)).toMatchObject({ reason: 'conflict', currentRevision: 1 });
     } finally { await client.close(); }
+  });
+});
+
+describe('task reminder updates', () => {
+  it('requires a separate management scope and documents the private-chat limit', async () => {
+    const updateTask = vi.fn(async (_owner: string, taskId: string, expectedRevision: number, action: 'complete' | 'cancel' | 'snooze', snoozeHours?: number) => ({
+      ok: true,
+      task: { id: taskId, revision: expectedRevision + 1, status: action, snoozeHours },
+    }));
+    const tasks: TaskControls = { updateTask };
+    const denied = await connectedClient([READ_SCOPE], { tasks });
+    try {
+      const result = await denied.client.callTool({ name: 'discord_update_task', arguments: {
+        taskId: `${origin.channelId}:${origin.messageId}`, expectedRevision: 1, action: 'complete',
+      } });
+      expect(result.isError).toBe(true);
+      expect((result.content[0] as { text: string }).text).toContain(TASK_MANAGE_SCOPE);
+      expect(updateTask).not.toHaveBeenCalled();
+    } finally { await denied.client.close(); }
+
+    const allowed = await connectedClient([READ_SCOPE, TASK_MANAGE_SCOPE], { tasks });
+    try {
+      const result = await allowed.client.callTool({ name: 'discord_update_task', arguments: {
+        taskId: `${origin.channelId}:${origin.messageId}`, expectedRevision: 1, action: 'complete',
+      } });
+      expect(result.isError).not.toBe(true);
+      expect(updateTask).toHaveBeenCalledExactlyOnceWith(POLICY_OWNER, `${origin.channelId}:${origin.messageId}`, 1, 'complete', undefined);
+      const tool = (await allowed.client.listTools()).tools.find((item) => item.name === 'discord_update_task');
+      expect(tool?.description).toContain('MCP authentication cannot prove that a call came from a private conversation');
+    } finally { await allowed.client.close(); }
   });
 });
 

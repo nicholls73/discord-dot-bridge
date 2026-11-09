@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { handleAuthorization } from '../src/oauth.js';
 import adminCss from '../src/admin.css.txt';
 import type { Env } from '../src/types.js';
+import { TASK_MANAGE_SCOPE } from '../src/task-reminders.js';
 
 // Match Wrangler's text-module loading instead of Vite's asset URL.
 vi.mock('../src/admin.css.txt', async () => {
@@ -292,6 +293,25 @@ describe('explicit optional channel permissions', () => {
     expect(response.status).toBe(302);
     expect(provider.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
       scope: ['discord:read', 'discord:reply', messageSend],
+    }));
+  });
+
+  it('offers task management separately and grants it only when explicitly selected', async () => {
+    const provider = helpers(['discord:read', 'discord:reply', channelRead, TASK_MANAGE_SCOPE]);
+    const currentEnv = env(provider);
+    const consent = await handleAuthorization(new Request('https://discord-dot.example.test/authorize'), currentEnv, async () => true);
+    const html = await consent.text();
+    expect(scopeInput(html, TASK_MANAGE_SCOPE)).toContain(`value="${TASK_MANAGE_SCOPE}"`);
+    expect(scopeInput(html, TASK_MANAGE_SCOPE)).not.toContain('checked');
+    expect(html).toContain('cannot prove that a tool call came from a private chat');
+    await handleAuthorization(consentPost(['discord:read', 'discord:reply', channelRead]), currentEnv, async () => true);
+    expect(provider.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      scope: ['discord:read', 'discord:reply', channelRead],
+    }));
+    await handleAuthorization(new Request('https://discord-dot.example.test/authorize'), currentEnv, async () => true);
+    await handleAuthorization(consentPost(['discord:read', 'discord:reply', channelRead, TASK_MANAGE_SCOPE]), currentEnv, async () => true);
+    expect(provider.completeAuthorization).toHaveBeenLastCalledWith(expect.objectContaining({
+      scope: ['discord:read', 'discord:reply', channelRead, TASK_MANAGE_SCOPE],
     }));
   });
 });
