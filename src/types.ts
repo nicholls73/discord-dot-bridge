@@ -13,6 +13,7 @@ export interface Env {
   ALLOW_LOCAL_AUTH?: string;
   DISCORD_BOT_TOKEN?: string;
   DISCORD_BOT_USER_ID?: string;
+  TASK_REMINDER_CHANNEL_IDS?: string;
   DISCORD_OAUTH_CLIENT_SECRET?: string;
 }
 

@@ -28,6 +28,9 @@ export interface DiscordChannelMessage {
   authorIsBot: boolean;
   content: string;
   timestamp: string;
+  mentionedUserIds?: string[];
+  replyToMessageId?: string;
+  threadId?: string;
   nonce?: string;
 }
 
@@ -206,7 +209,7 @@ export class DiscordRestMessenger implements DiscordMessenger {
     authorizeGuild: (guildId: string) => Promise<boolean>,
     destinationType: DiscordDestinationType = 'channel',
   ): Promise<DiscordChannelPage> {
-    if (!Number.isInteger(limit) || limit < 1 || limit > 20 || (before && !isDiscordSnowflake(before))) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 || (before && !isDiscordSnowflake(before))) {
       throw new TypeError('Invalid Discord channel page.');
     }
     let stage: ChannelReadStage = 'channel_lookup';
@@ -264,6 +267,28 @@ export class DiscordRestMessenger implements DiscordMessenger {
               : 'unexpected_failure';
       throw new ChannelReadDiagnosticError(stage, reason);
     }
+  }
+
+  async getChannelMessage(
+    channelId: string,
+    messageId: string,
+    authorizeGuild: (guildId: string) => Promise<boolean>,
+    destinationType: DiscordDestinationType = 'channel',
+  ): Promise<DiscordChannelMessage | null> {
+    if (!isDiscordSnowflake(messageId)) throw new TypeError('Invalid Discord message ID.');
+    const channel = await this.getGuildMessageTarget(channelId, destinationType);
+    if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
+    await this.requirePermissions(channel, VIEW_CHANNEL | READ_MESSAGE_HISTORY);
+    let response: Response;
+    try {
+      response = await this.request(`${API}/channels/${channelId}/messages/${messageId}`, { method: 'GET' });
+    } catch (error) {
+      if (error instanceof DiscordHttpError && error.status === 404) return null;
+      throw error;
+    }
+    const message = parseMessage(await readJson(response), channelId);
+    if (!await authorizeGuild(channel.guildId)) throw new TypeError('Discord server access is no longer authorized.');
+    return message;
   }
 
   async findOwnMessageByNonce(
@@ -619,6 +644,26 @@ function parseMessage(value: unknown, expectedChannelId: string): DiscordChannel
     authorIsBot: author.bot === true || typeof message.webhook_id === 'string',
     content: message.content,
     timestamp: new Date(message.timestamp).toISOString(),
+    mentionedUserIds: Array.isArray(message.mentions)
+      ? message.mentions.flatMap((mention: unknown) => {
+        const id = mention && typeof mention === 'object' ? (mention as { id?: unknown }).id : undefined;
+        return typeof id === 'string' && isDiscordSnowflake(id) ? [id] : [];
+      })
+      : [],
+    ...(isMessageReference(message.type, message.message_reference, expectedChannelId) ? { replyToMessageId: message.message_reference.message_id as string } : {}),
+    ...(isRecord(message.thread) && typeof message.thread.id === 'string' && isDiscordSnowflake(message.thread.id)
+      ? { threadId: message.thread.id } : {}),
     ...(typeof message.nonce === 'string' && message.nonce.length <= 25 ? { nonce: message.nonce } : {}),
   };
+}
+
+function isMessageReference(messageType: unknown, value: unknown, channelId: string): value is { message_id: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const reference = value as Record<string, unknown>;
+  return messageType === 19 && (reference.type === undefined || reference.type === 0) &&
+    (reference.channel_id === undefined || reference.channel_id === channelId) && isDiscordSnowflake(reference.message_id as string);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

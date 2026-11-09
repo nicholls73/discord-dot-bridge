@@ -12,7 +12,7 @@ After completing the [deployment guide](deployment.md), configure Discord permis
 
 Add an OAuth MCP connection in your dot host using `https://discord-dot.<workers_dev_subdomain>.workers.dev/mcp`. Sign in through the owner Access gate and approve `discord:read` and `discord:reply`. Configure the [listener guidance](response-policy.md#listener-setup) on that same dot, and use the host's native MCP Events support to subscribe to `discord.message.mentioned`. The [canary](#canary-sequence) verifies that the subscription wakes the intended dot and its reply reaches Discord. A host without MCP Events support cannot receive mention wakes from this bridge.
 
-Only request `discord:channel:read`, `discord:message:send` or `discord:message:edit` when needed. Each scope is separately shown on consent and starts unchecked. Other connectors are optional and are not configured by this project.
+Only request `discord:channel:read`, `discord:message:send`, `discord:message:edit` or `discord:task:manage` when needed. Each scope is separately shown on consent and starts unchecked. Task events and their extra authorization are described in [task reminders](task-reminders.md). Other connectors are optional and are not configured by this project.
 
 Terraform creates separate owner-only Cloudflare Access applications for `/admin` and `/authorize`, restricted to the configured identity provider and owner email. The Worker checks the corresponding audience for each route. Server/member grant administration remains owner-authenticated and is not an MCP tool.
 

@@ -93,7 +93,7 @@ describe('Worker routing and OAuth discovery', () => {
       authorization_endpoint: `${issuer}/authorize`,
       token_endpoint: `${issuer}/oauth/token`,
       registration_endpoint: `${issuer}/oauth/register`,
-      scopes_supported: ['discord:read', 'discord:reply', 'discord:channel:read', 'discord:message:send', 'discord:message:edit', 'discord:policy:manage'],
+      scopes_supported: ['discord:read', 'discord:reply', 'discord:channel:read', 'discord:message:send', 'discord:message:edit', 'discord:policy:manage', 'discord:task:manage'],
     });
   });
 

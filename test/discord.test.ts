@@ -315,6 +315,40 @@ describe('Discord conversation context', () => {
 describe('Discord channel adapter', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('keeps message mentions, reply links and attached public-thread IDs', async () => {
+    const taskOwnerId = '99999999999999999';
+    const taskThreadId = '88888888888888888';
+    const repliedMessageId = '44444444444444444';
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === `/api/v10/channels/${channelId}`) {
+        return Response.json({ id: channelId, guild_id: guildId, type: 0, permission_overwrites: [] });
+      }
+      if (url.pathname === `/api/v10/guilds/${guildId}/members/${botUserId}`) {
+        return Response.json({ user: { id: botUserId }, roles: [] });
+      }
+      if (url.pathname === `/api/v10/guilds/${guildId}/roles`) {
+        return Response.json([{ id: guildId, permissions: requiredPermissions }]);
+      }
+      if (url.pathname === `/api/v10/channels/${channelId}/messages`) {
+        return Response.json([{
+          id: '66666666666666666', channel_id: channelId, guild_id: guildId, type: 19,
+          author: { id: origin.authorId, username: 'Synthetic colleague', bot: false },
+          content: `<@${taskOwnerId}> can you review the HTML?`, timestamp: origin.timestamp,
+          mentions: [{ id: taskOwnerId }],
+          message_reference: { type: 0, channel_id: channelId, message_id: repliedMessageId },
+          thread: { id: taskThreadId },
+        }]);
+      }
+      return new Response(null, { status: 404 });
+    });
+    const messenger = new DiscordRestMessenger('test-bot-token', fetcher as typeof fetch, botUserId);
+    const page = await messenger.listChannelMessages(channelId, undefined, 20, async () => true);
+    expect(page.messages[0]).toMatchObject({
+      mentionedUserIds: [taskOwnerId], replyToMessageId: repliedMessageId, threadId: taskThreadId,
+    });
+  });
+
   describe.each(['members/' + botUserId, 'roles'])('permission rate limits on %s', (endpoint) => {
     function limitedFetch(responses: Response[], permissions = requiredPermissions) {
       const fallback = discordApiFetch({ permissions });

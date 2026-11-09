@@ -121,6 +121,11 @@ resource "cloudflare_workers_script" "discord_dot" {
       text = var.discord_bot_user_id
     },
     {
+      name = "TASK_REMINDER_CHANNEL_IDS"
+      type = "plain_text"
+      text = join(",", var.task_reminder_channel_ids)
+    },
+    {
       name = "DISCORD_BOT_TOKEN"
       type = "secret_text"
       text = var.discord_bot_token

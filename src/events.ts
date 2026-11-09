@@ -1,6 +1,9 @@
 import type { OriginMessage } from './policy.js';
+import { TASK_CAPTURED_EVENT_NAME, TASK_REMINDER_EVENT_NAME, type TaskEventName, type TaskReminderEvent } from './task-reminders.js';
 
 export const MENTION_EVENT_NAME = 'discord.message.mentioned' as const;
+export { TASK_CAPTURED_EVENT_NAME, TASK_REMINDER_EVENT_NAME };
+export type BridgeEventName = typeof MENTION_EVENT_NAME | TaskEventName;
 
 export interface EventAuthorizationReference {
   grantId: string;
@@ -12,7 +15,7 @@ export interface EventAuthorizationReference {
 export interface EventSubscriptionIdentity {
   id: string;
   principal: string;
-  name: typeof MENTION_EVENT_NAME;
+  name: BridgeEventName;
   arguments: Record<string, never>;
   url: string;
 }
@@ -42,6 +45,8 @@ export interface MentionEvent {
   };
   cursor: null;
 }
+
+export type BridgeEvent = MentionEvent | TaskReminderEvent;
 
 export function toMentionEvent(origin: OriginMessage): MentionEvent {
   return {
@@ -74,7 +79,7 @@ export function canonicalJson(value: unknown): string {
 export async function makeSubscriptionId(
   principal: string,
   url: string,
-  name: typeof MENTION_EVENT_NAME,
+  name: BridgeEventName,
   arguments_: Record<string, never>,
 ): Promise<string> {
   const identity = `${principal}\n${url}\n${name}\n${canonicalJson(arguments_)}`;

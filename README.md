@@ -18,6 +18,8 @@ end-to-end mention test after installation.
   REST message-content access; uncertain sends are not automatically repeated.
 - Optional, separately consented channel reads, standalone sends and edits to
   the bot's own messages. General channel traffic does not trigger replies.
+- Optional, explicit-channel task tracking and private MCP event reminders, off
+  by default and separate from mention handling.
 - An owner-supplied response policy with revision checks and history. No policy
   content is bundled or reset during upgrades.
 
@@ -62,6 +64,7 @@ live Discord-to-dot connection. CI runs them without cloud secrets.
 ## Operation and security
 
 - [Gateway, permissions, subscriptions and troubleshooting](docs/gateway-events.md)
+- [Optional task reminders and their limits](docs/task-reminders.md)
 - [Response policy and listener privacy boundaries](docs/response-policy.md)
 - [Webhook transport and Cloudflare trust assumptions](docs/webhook-callbacks.md)
 

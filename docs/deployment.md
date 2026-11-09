@@ -50,6 +50,7 @@ through a secret manager, without committing them:
 | `CLOUDFLARE_API_TOKEN` | Account-scoped deployment token |
 | `TF_VAR_discord_bot_token` | Discord bot token |
 | `TF_VAR_discord_oauth_client_secret` | Discord OAuth client secret |
+| `TF_VAR_task_reminder_channel_ids` | Optional list of explicitly selected channel IDs from private deployment configuration; omit it to keep task reminders disabled |
 | `AWS_ACCESS_KEY_ID` | R2 state-bucket access key ID |
 | `AWS_SECRET_ACCESS_KEY` | R2 state-bucket secret access key |
 
@@ -144,6 +145,20 @@ the owner, install your bot, link your Discord account and explicitly approve
 a server and grant a member or role. Supply your own
 [response policy](response-policy.md), then [connect the dot and run the canary](gateway-events.md#connect-the-dot).
 Installing the bot or subscribing grants nobody access by itself.
+
+Task reminders are disabled when `task_reminder_channel_ids` is empty (the
+default). To enable them in a later, separately authorised deployment, select
+at most ten text or announcement channel IDs that are already in approved
+servers. The bot must have `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY` in each
+selected channel, and Discord must permit the application to read message
+content. The [Get Channel Messages endpoint](https://docs.discord.com/developers/resources/message#get-channel-messages)
+returns newest-first pages of up to 100 messages. The feature reads only the
+selected channels and public threads attached to task messages; it does not
+request a new Gateway intent or change any OAuth grant automatically. Task event
+subscriptions also require the separately consented `discord:channel:read` and
+`discord:task:manage` scopes, in addition to the core `discord:read` and
+`discord:reply` scopes. See [task reminder operation](task-reminders.md) before
+selecting channels.
 
 For updates, retain the backend and bindings, leave the bootstrap override
 absent, and review the plan. Grants, policy and revision history must survive

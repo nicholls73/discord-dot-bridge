@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   EventProtocolError,
+  handleEventProtocolRequest,
   isValidSigningSecret,
   postSignedEvent,
   retryDelayMs,
@@ -9,6 +10,7 @@ import {
   verifyCallback,
   type EventSubscriptionInput,
 } from '../src/mcp-events.js';
+import { TASK_CAPTURED_EVENT_NAME, TASK_REMINDER_EVENT_NAME } from '../src/task-reminders.js';
 
 const secret = `whsec_${Buffer.from(new Uint8Array(32).fill(7)).toString('base64')}`;
 const subscription: EventSubscriptionInput = {
@@ -22,6 +24,41 @@ const subscription: EventSubscriptionInput = {
 };
 
 describe('MCP webhook event security', () => {
+  it('lists task events only when configured and requires both separately consented scopes to subscribe', async () => {
+    const backend = {
+      subscribe: vi.fn(async (value: EventSubscriptionInput) => ({ id: value.id, refreshBefore: value.refreshBefore })),
+      unsubscribe: vi.fn(async () => undefined),
+      callbackVerified: vi.fn(async () => true),
+    };
+    const list = await handleEventProtocolRequest(new Request('https://bridge.example.test/mcp', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events/list' }),
+    }), backend, { principal: subscription.principal, canRead: true, canReply: true, eventsEnabled: true, taskEventsEnabled: true });
+    const listed = await list!.json() as { result: { events: Array<{ name: string }> } };
+    expect(listed.result.events.map((event) => event.name)).toContain(TASK_CAPTURED_EVENT_NAME);
+    expect(listed.result.events.map((event) => event.name)).toContain(TASK_REMINDER_EVENT_NAME);
+
+    const request = (name: string) => new Request('https://bridge.example.test/mcp', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'events/subscribe', params: {
+        name, arguments: {}, delivery: { mode: 'webhook', url: subscription.url, secret },
+      } }),
+    });
+    const missingScopes = await handleEventProtocolRequest(request(TASK_CAPTURED_EVENT_NAME), backend, {
+      principal: subscription.principal, canRead: true, canReply: true, eventsEnabled: true, taskEventsEnabled: true,
+    });
+    expect((await missingScopes!.json() as { error?: { code: number } }).error).toMatchObject({ code: -32001 });
+    expect(backend.subscribe).not.toHaveBeenCalled();
+
+    const approved = await handleEventProtocolRequest(request(TASK_CAPTURED_EVENT_NAME), backend, {
+      principal: subscription.principal, canRead: true, canReply: true, eventsEnabled: true, taskEventsEnabled: true,
+      canManageTasks: true, canReadChannelHistory: true,
+    });
+    expect((await approved!.json() as { result?: { id: string } }).result).toMatchObject({ id: expect.any(String) });
+    expect(backend.subscribe).toHaveBeenCalledOnce();
+    expect(backend.subscribe.mock.calls[0]![0].name).toBe(TASK_CAPTURED_EVENT_NAME);
+  });
+
   it('validates HTTPS callback addresses and rejects local, reserved, and IP-literal targets', () => {
     expect(validateCallbackUrl(subscription.url)).toBe(subscription.url);
     for (const url of [
