@@ -170,6 +170,7 @@ export interface BridgeStateRuntime {
 /** Owns the single Discord Gateway session, validated origins, and durable event outbox. */
 export class BridgeStateDO extends DurableObject<Env> implements OriginStore, MentionRecoveryStore, ChannelAccessStore, StandaloneMessageStore {
   private readonly nonThreadChannels = new Set<string>();
+  private taskDeliveryTail: Promise<unknown> = Promise.resolve();
   private typingWork: Promise<void> | null = null;
   private gatewaySocket: WebSocket | null = null;
   private gatewayProtocol: DiscordGatewayProtocol | null = null;
@@ -644,7 +645,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     }
     const link = await this.getLinkedDiscordAccount(ownerEmail);
     if (!link) return { ok: false, reason: 'not_found', currentRevision: 0 };
-    const result = await this.ctx.storage.transaction(async (transaction): Promise<TaskUpdateResult> => {
+    const result = await this.withTaskDeliveryLock(() => this.ctx.storage.transaction(async (transaction): Promise<TaskUpdateResult> => {
       const key = taskKey(taskId);
       const task = await transaction.get<TrackedTask>(key);
       if (!task || task.ownerId !== link.userId) return { ok: false, reason: 'not_found', currentRevision: 0 };
@@ -666,7 +667,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       // text or durable scan buffers after their authors' grants may have changed.
       const { id, revision, status, nextReminderAt } = updated;
       return { ok: true, task: { id, revision, status, nextReminderAt } };
-    });
+    }));
     await this.scheduleNextWake();
     return result;
   }
@@ -1476,24 +1477,24 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   }
 
   private async authorizedTaskMessages(messages: TaskReminderMessage[]): Promise<TaskReminderMessage[]> {
-    const allowed: TaskReminderMessage[] = [];
-    const memberAccess = new Map<string, Promise<MemberAuthorizationResult>>();
-    for (const message of messages) {
-      if (message.authorIsBot) {
-        if (message.authorId === this.env.DISCORD_BOT_USER_ID) allowed.push(message);
-        continue;
+    const members = [...new Map(messages.filter((message) => !message.authorIsBot)
+      .map((message) => [`${message.guildId}:${message.authorId}`, message] as const)).entries()];
+    const access = new Map<string, MemberAuthorizationResult>();
+    let next = 0;
+    // Bound concurrent Discord lookups, deduplicate authors within the page, and
+    // never reuse access across pages/alarms where a grant could have changed.
+    await Promise.all(Array.from({ length: Math.min(4, members.length) }, async () => {
+      while (next < members.length) {
+        const [key, message] = members[next++]!;
+        access.set(key, await this.isAuthorizedMember(message.guildId, message.authorId));
       }
-      const memberKey = `${message.guildId}:${message.authorId}`;
-      let accessRequest = memberAccess.get(memberKey);
-      if (!accessRequest) {
-        accessRequest = this.isAuthorizedMember(message.guildId, message.authorId);
-        memberAccess.set(memberKey, accessRequest);
-      }
-      const access = await accessRequest;
-      if (access.status === 'unavailable') throw new Error('Discord member authorization is unavailable.');
-      if (access.status === 'authorized') allowed.push(message);
+    }));
+    if ([...access.values()].some((result) => result.status === 'unavailable')) {
+      throw new Error('Discord member authorization is unavailable.');
     }
-    return allowed;
+    return messages.filter((message) => message.authorIsBot
+      ? message.authorId === this.env.DISCORD_BOT_USER_ID
+      : access.get(`${message.guildId}:${message.authorId}`)?.status === 'authorized');
   }
 
   private async processTaskMessages(
@@ -1760,20 +1761,45 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
           continue;
         }
       }
-      let status = 0;
-      try {
-        validateCallbackUrl(subscription.url);
-        const result = await postSignedEvent(subscription, delivery.event, this.webhookFetch, this.now());
-        status = result.status;
-        if (result.accepted || status === 410 || status === 413) {
-          await this.ctx.storage.delete(key);
-          continue;
-        }
-      } catch {
-        status = 0;
+      if (!mentionEvent) {
+        await this.withTaskDeliveryLock(async () => {
+          // Authorization awaits may have let an owner update delete this event.
+          // Serialize the final check, signing, send and retry with owner updates.
+          const pending = await this.ctx.storage.get<PendingDelivery>(key);
+          const latest = taskId ? await this.ctx.storage.get<TrackedTask>(taskKey(taskId)) : undefined;
+          if (!pending || !latest) return;
+          const revision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
+          if (delivery.event.name === TASK_REMINDER_EVENT_NAME &&
+              (latest.status !== 'open' || latest.revision !== revision)) {
+            await this.ctx.storage.delete(key);
+            return;
+          }
+          await this.sendDelivery(key, subscription, delivery);
+        });
+      } else {
+        await this.sendDelivery(key, subscription, delivery);
       }
-      await this.retryDelivery(key, delivery);
     }
+  }
+
+  private withTaskDeliveryLock<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.taskDeliveryTail.then(work);
+    this.taskDeliveryTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private async sendDelivery(key: string, subscription: EventSubscription, delivery: PendingDelivery): Promise<void> {
+    try {
+      validateCallbackUrl(subscription.url);
+      const result = await postSignedEvent(subscription, delivery.event, this.webhookFetch, this.now());
+      if (result.accepted || result.status === 410 || result.status === 413) {
+        await this.ctx.storage.delete(key);
+        return;
+      }
+    } catch {
+      // Preserve the existing bounded retry policy for failed/uncertain sends.
+    }
+    await this.retryDelivery(key, delivery);
   }
 
   private async isSubscriptionAuthorized(subscription: EventSubscription): Promise<boolean> {

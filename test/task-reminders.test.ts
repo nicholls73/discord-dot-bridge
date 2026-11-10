@@ -206,6 +206,24 @@ describe('task reminder authorization boundaries', () => {
     return { storage, bridge, internal, callback, subscription };
   }
 
+  it('deduplicates page authors with bounded parallel checks and preserves message order', async () => {
+    const { internal } = fixture();
+    let active = 0;
+    let maxActive = 0;
+    internal.isAuthorizedMember.mockImplementation(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      active -= 1;
+      return { status: 'authorized' };
+    });
+    const messages = Array.from({ length: 12 }, (_, index) => message({ authorId: String(BigInt(authorId) + BigInt(index % 6)) }));
+    expect(await internal.authorizedTaskMessages(messages)).toEqual(messages);
+    expect(internal.isAuthorizedMember).toHaveBeenCalledTimes(6);
+    expect(maxActive).toBeGreaterThan(1);
+    expect(maxActive).toBeLessThanOrEqual(4);
+  });
+
   it.each(['channel', 'thread'])('filters each %s page before durable buffering', async (kind) => {
     const { storage, internal } = fixture();
     internal.isAuthorizedMember.mockImplementation(async (_guild: string, author: string) => ({
@@ -328,6 +346,40 @@ describe('task reminder authorization boundaries', () => {
     await internal.processDueDeliveries();
     expect(callback).toHaveBeenCalledOnce();
     expect(JSON.parse(String(callback.mock.calls[0]![1]?.body)).name).toBe(TASK_CAPTURED_EVENT_NAME);
+  });
+
+  it.each(['member', 'channel'])('drops a reminder completed during the %s authorization await', async (stage) => {
+    const { storage, internal, subscription, callback } = fixture();
+    const tracked = task();
+    await storage.put(taskKey(tracked.id), tracked);
+    await storage.put(`subscription:${subscription.id}`, subscription);
+    await storage.put('delivery:race', { subscriptionId: subscription.id,
+      event: toTaskEvent(tracked, TASK_REMINDER_EVENT_NAME, time), attempts: 0, nextAttemptAt: time });
+    const complete = async () => { await internal.updateTask('owner@example.test', tracked.id, 1, 'complete'); };
+    if (stage === 'member') internal.isAuthorizedMember.mockImplementation(async () => { await complete(); return { status: 'authorized' }; });
+    else internal.isChannelAuthorized.mockImplementation(async () => { await complete(); return true; });
+    await internal.processDueDeliveries();
+    expect(callback).not.toHaveBeenCalled();
+    expect(await storage.get('delivery:race')).toBeUndefined();
+  });
+
+  it('orders an owner update after an already-started send, without resurrecting a failed reminder', async () => {
+    const { storage, internal, subscription, callback } = fixture();
+    const tracked = task();
+    await storage.put(taskKey(tracked.id), tracked);
+    await storage.put(`subscription:${subscription.id}`, subscription);
+    await storage.put('delivery:race', { subscriptionId: subscription.id,
+      event: toTaskEvent(tracked, TASK_REMINDER_EVENT_NAME, time), attempts: 0, nextAttemptAt: time });
+    let update: Promise<unknown> | undefined;
+    callback.mockImplementation(async () => {
+      update = internal.updateTask('owner@example.test', tracked.id, 1, 'cancel');
+      return new Response(null, { status: 503 });
+    });
+    await internal.processDueDeliveries();
+    await update;
+    expect(callback).toHaveBeenCalledOnce();
+    expect(await storage.get('delivery:race')).toBeUndefined();
+    expect(await storage.get(taskKey(tracked.id))).toMatchObject({ status: 'cancelled' });
   });
 
   it('returns only task metadata from owner updates, never source text or scan buffers', async () => {

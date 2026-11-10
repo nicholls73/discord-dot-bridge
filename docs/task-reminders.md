@@ -72,6 +72,9 @@ still has valid OAuth scopes. Source-author grants are checked again before any
 task callback is sent; unavailable checks defer delivery and denied checks drop
 it. Captured events retain their original capture semantics if the owner updates
 the task before delivery, while reminders require the current open revision.
+The final reminder check/sign/send/retry is serialized with owner updates. An
+update completed during authorization prevents that reminder; an already-started
+send finishes before the update commits and cannot be recalled.
 An edited actionable source gets a fresh 24-hour delay from when the edit is
 processed, not from the original message creation time. Repeated
 sweeps, restarts and overlapping alarms use durable task IDs, revisions and a
