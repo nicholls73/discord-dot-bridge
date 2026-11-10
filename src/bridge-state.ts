@@ -89,7 +89,7 @@ interface TaskChannelScan {
   messages: TaskReminderMessage[];
 }
 
-export type TaskUpdateResult = { ok: true; task: TrackedTask } | { ok: false; reason: 'conflict' | 'not_found'; currentRevision: number };
+export type TaskUpdateResult = { ok: true; task: Pick<TrackedTask, 'id' | 'revision' | 'status' | 'nextReminderAt'> } | { ok: false; reason: 'conflict' | 'not_found'; currentRevision: number };
 
 export interface AdminRuntimeStatus {
   state: 'idle' | 'connecting' | 'connected' | 'unavailable';
@@ -662,7 +662,10 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         if (delivery.event.name === TASK_REMINDER_EVENT_NAME && 'task_id' in delivery.event.data &&
             delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
       }
-      return { ok: true, task: updated };
+      // A management response is not a source-message read. Do not return source
+      // text or durable scan buffers after their authors' grants may have changed.
+      const { id, revision, status, nextReminderAt } = updated;
+      return { ok: true, task: { id, revision, status, nextReminderAt } };
     });
     await this.scheduleNextWake();
     return result;

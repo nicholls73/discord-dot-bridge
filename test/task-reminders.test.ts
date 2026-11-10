@@ -330,6 +330,19 @@ describe('task reminder authorization boundaries', () => {
     expect(JSON.parse(String(callback.mock.calls[0]![1]?.body)).name).toBe(TASK_CAPTURED_EVENT_NAME);
   });
 
+  it('returns only task metadata from owner updates, never source text or scan buffers', async () => {
+    const { storage, internal } = fixture();
+    const tracked = task({ threadScan: { before: sourceId, highWaterId: sourceId, messages: [message({ content: 'BUFFER-PRIVATE' })] } });
+    await storage.put(taskKey(tracked.id), tracked);
+    internal.isAuthorizedMember.mockResolvedValue({ status: 'denied' });
+    const result = await internal.updateTask('owner@example.test', tracked.id, 1, 'cancel');
+    expect(result).toEqual({ ok: true, task: {
+      id: tracked.id, revision: 2, status: 'cancelled', nextReminderAt: tracked.nextReminderAt,
+    } });
+    expect(JSON.stringify(result)).not.toContain(tracked.text);
+    expect(JSON.stringify(result)).not.toContain('BUFFER-PRIVATE');
+  });
+
   it('does not suppress a completion after an edited source in the same delayed sweep', async () => {
     const { storage, internal } = fixture();
     const tracked = task();

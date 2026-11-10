@@ -79,7 +79,8 @@ delivery outbox to avoid duplicate captures and reminder sends.
 
 The owner can ask the connected dot to mark a task complete or cancelled, or
 snooze it for 1 to 720 hours, using `discord_update_task` with the task ID and
-current revision. Discord content cannot authorize this tool. MCP authentication
+current revision. Its response returns task metadata only, not source text or
+internal scan buffers. Discord content cannot authorize this tool. MCP authentication
 proves the owner grant but cannot prove that a call came from a private dot chat;
 the assistant must use it only after an explicit owner instruction in that
 private chat. The callback payload contains untrusted Discord text and must not
