@@ -1174,6 +1174,7 @@ describe('task reminder updates', () => {
       expect(result.isError).not.toBe(true);
       expect(updateTask).toHaveBeenCalledExactlyOnceWith(POLICY_OWNER, `${origin.channelId}:${origin.messageId}`, 1, 'complete', undefined);
       const tool = (await allowed.client.listTools()).tools.find((item) => item.name === 'discord_update_task');
+      expect(tool?.description).toContain('Use only after the configured owner explicitly instructs you in their private dot chat to complete, cancel or snooze one of their tracked tasks.');
       expect(tool?.description).toContain('MCP authentication cannot prove that a call came from a private conversation');
     } finally { await allowed.client.close(); }
   });

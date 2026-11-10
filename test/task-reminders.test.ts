@@ -60,9 +60,9 @@ describe('task reminder detection and lifecycle', () => {
     }), ownerId)).toMatchObject({ ownership: 'commitment', ownerId, sourceAuthorId: ownerId });
   });
 
-  it('does not assign another person’s promise to James or turn discussion into a task', () => {
+  it('does not assign another person’s promise to Alex or turn discussion into a task', () => {
     expect(detectTaskCandidate(message({ authorId: '44444444444444444', content: 'I will CC the client.' }), ownerId)).toBeNull();
-    expect(detectTaskCandidate(message({ content: 'Maybe James should review the HTML.' , mentionedUserIds: [] }), ownerId)).toBeNull();
+    expect(detectTaskCandidate(message({ content: 'Maybe Alex should review the HTML.' , mentionedUserIds: [] }), ownerId)).toBeNull();
     expect(detectTaskCandidate(message({ content: '> I’ll review the HTML.\nWe should consider that.' , authorId: ownerId, mentionedUserIds: [] }), ownerId)).toBeNull();
     expect(detectTaskCandidate(message({ authorIsBot: true }), ownerId)).toBeNull();
   });
@@ -99,10 +99,10 @@ describe('task reminder detection and lifecycle', () => {
     const original = task();
     expect(applySourceEdit(original, message()).revision).toBe(original.revision);
     const edited = applySourceEdit(original, message({
-      content: 'Maybe James could review this sometime.', mentionedUserIds: [],
+      content: 'Maybe Alex could review this sometime.', mentionedUserIds: [],
       timestamp: '2026-11-09T13:00:00.000Z',
     }));
-    expect(edited).toMatchObject({ status: 'cancelled', text: 'Maybe James could review this sometime.' });
+    expect(edited).toMatchObject({ status: 'cancelled', text: 'Maybe Alex could review this sometime.' });
   });
 
   it('limits reminders and observes a seven-day cooldown across repeated sweeps', () => {
