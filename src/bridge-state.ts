@@ -89,7 +89,7 @@ interface TaskChannelScan {
   messages: TaskReminderMessage[];
 }
 
-export type TaskUpdateResult = { ok: true; task: TrackedTask } | { ok: false; reason: 'conflict' | 'not_found'; currentRevision: number };
+export type TaskUpdateResult = { ok: true; task: Pick<TrackedTask, 'id' | 'revision' | 'status' | 'nextReminderAt'> } | { ok: false; reason: 'conflict' | 'not_found'; currentRevision: number };
 
 export interface AdminRuntimeStatus {
   state: 'idle' | 'connecting' | 'connected' | 'unavailable';
@@ -170,6 +170,7 @@ export interface BridgeStateRuntime {
 /** Owns the single Discord Gateway session, validated origins, and durable event outbox. */
 export class BridgeStateDO extends DurableObject<Env> implements OriginStore, MentionRecoveryStore, ChannelAccessStore, StandaloneMessageStore {
   private readonly nonThreadChannels = new Set<string>();
+  private taskDeliveryTail: Promise<unknown> = Promise.resolve();
   private typingWork: Promise<void> | null = null;
   private gatewaySocket: WebSocket | null = null;
   private gatewayProtocol: DiscordGatewayProtocol | null = null;
@@ -644,7 +645,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     }
     const link = await this.getLinkedDiscordAccount(ownerEmail);
     if (!link) return { ok: false, reason: 'not_found', currentRevision: 0 };
-    const result = await this.ctx.storage.transaction(async (transaction): Promise<TaskUpdateResult> => {
+    const result = await this.withTaskDeliveryLock(() => this.ctx.storage.transaction(async (transaction): Promise<TaskUpdateResult> => {
       const key = taskKey(taskId);
       const task = await transaction.get<TrackedTask>(key);
       if (!task || task.ownerId !== link.userId) return { ok: false, reason: 'not_found', currentRevision: 0 };
@@ -659,10 +660,14 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       await transaction.put(key, updated);
       const deliveries = await transaction.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
       for (const [deliveryKey, delivery] of deliveries) {
-        if ('task_id' in delivery.event.data && delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
+        if (delivery.event.name === TASK_REMINDER_EVENT_NAME && 'task_id' in delivery.event.data &&
+            delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
       }
-      return { ok: true, task: updated };
-    });
+      // A management response is not a source-message read. Do not return source
+      // text or durable scan buffers after their authors' grants may have changed.
+      const { id, revision, status, nextReminderAt } = updated;
+      return { ok: true, task: { id, revision, status, nextReminderAt } };
+    }));
     await this.scheduleNextWake();
     return result;
   }
@@ -1404,6 +1409,18 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     let pageCount = 0;
     const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
 
+    if (scan) {
+      try {
+        scan.messages = await this.authorizedTaskMessages(scan.messages);
+        await this.ctx.storage.put(scanKey, scan);
+      } catch {
+        // Discard a legacy/resumed buffer whose current grants cannot be established.
+        // The committed cursor is unchanged, so the next sweep can safely restart.
+        await this.ctx.storage.delete(scanKey);
+        throw new Error('Discord member authorization is unavailable.');
+      }
+    }
+
     if (!scan) {
       const page = await messenger.listChannelMessages(channelId, undefined, TASK_PAGE_SIZE, authorizeGuild);
       if (!page.messages.length) return true;
@@ -1415,7 +1432,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         highWaterId,
         cursor,
         cutoffAt,
-        messages: eligibleTaskMessages(messages, cursor, cutoffAt),
+        messages: await this.authorizedTaskMessages(eligibleTaskMessages(messages, cursor, cutoffAt)),
       };
       pageCount = 1;
       if (pageBoundaryReached(messages, cursor, cutoffAt, page.nextBefore)) {
@@ -1429,7 +1446,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const page = await messenger.listChannelMessages(channelId, scan.before, TASK_PAGE_SIZE, authorizeGuild);
       pageCount += 1;
       const messages = toTaskMessages(page.guildId, page.messages);
-      scan.messages.push(...eligibleTaskMessages(messages, scan.cursor, scan.cutoffAt));
+      scan.messages.push(...await this.authorizedTaskMessages(eligibleTaskMessages(messages, scan.cursor, scan.cutoffAt)));
       if (pageBoundaryReached(messages, scan.cursor, scan.cutoffAt, page.nextBefore)) {
         await this.finishTaskChannelScan(scanKey, cursorKey, scan, ownerId, ownerEmail, subscriptions);
         return true;
@@ -1452,32 +1469,32 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     ownerEmail: string,
     subscriptions: EventSubscription[],
   ): Promise<void> {
-    const authorizedMessages = await this.authorizedTaskMessages(scan.messages, ownerEmail);
+    const authorizedMessages = await this.authorizedTaskMessages(scan.messages);
     authorizedMessages.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
     await this.processTaskMessages(authorizedMessages, ownerId, subscriptions);
     await this.ctx.storage.put(cursorKey, scan.highWaterId);
     await this.ctx.storage.delete(scanKey);
   }
 
-  private async authorizedTaskMessages(messages: TaskReminderMessage[], ownerEmail: string): Promise<TaskReminderMessage[]> {
-    const allowed: TaskReminderMessage[] = [];
-    const memberAccess = new Map<string, Promise<MemberAuthorizationResult>>();
-    for (const message of messages) {
-      if (message.authorIsBot) {
-        if (message.authorId === this.env.DISCORD_BOT_USER_ID) allowed.push(message);
-        continue;
+  private async authorizedTaskMessages(messages: TaskReminderMessage[]): Promise<TaskReminderMessage[]> {
+    const members = [...new Map(messages.filter((message) => !message.authorIsBot)
+      .map((message) => [`${message.guildId}:${message.authorId}`, message] as const)).entries()];
+    const access = new Map<string, MemberAuthorizationResult>();
+    let next = 0;
+    // Bound concurrent Discord lookups, deduplicate authors within the page, and
+    // never reuse access across pages/alarms where a grant could have changed.
+    await Promise.all(Array.from({ length: Math.min(4, members.length) }, async () => {
+      while (next < members.length) {
+        const [key, message] = members[next++]!;
+        access.set(key, await this.isAuthorizedMember(message.guildId, message.authorId));
       }
-      const memberKey = `${message.guildId}:${message.authorId}`;
-      let accessRequest = memberAccess.get(memberKey);
-      if (!accessRequest) {
-        accessRequest = this.isAuthorizedMember(message.guildId, message.authorId);
-        memberAccess.set(memberKey, accessRequest);
-      }
-      const access = await accessRequest;
-      if (access.status === 'unavailable') throw new Error('Discord member authorization is unavailable.');
-      if (access.status === 'authorized') allowed.push(message);
+    }));
+    if ([...access.values()].some((result) => result.status === 'unavailable')) {
+      throw new Error('Discord member authorization is unavailable.');
     }
-    return allowed;
+    return messages.filter((message) => message.authorIsBot
+      ? message.authorId === this.env.DISCORD_BOT_USER_ID
+      : access.get(`${message.guildId}:${message.authorId}`)?.status === 'authorized');
   }
 
   private async processTaskMessages(
@@ -1490,7 +1507,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     for (const message of messages) {
       for (const [key, task] of tasks) {
         if (task.status !== 'open' || task.guildId !== message.guildId) continue;
-        let updated = applySourceEdit(task, message);
+        let updated = applySourceEdit(task, message, this.now());
         updated = applyTaskFollowup(updated, message, ownerId);
         if (updated.revision === task.revision) continue;
         const saved = await this.ctx.storage.transaction(async (transaction) => {
@@ -1556,6 +1573,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       let task = storedTask;
       if (!channels.has(task.channelId) || task.ownerId !== link.userId || !shouldSendReminder(task, this.now())) continue;
       if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) continue;
+      const sourceAccess = await this.isAuthorizedMember(task.guildId, task.sourceAuthorId);
+      if (sourceAccess.status !== 'authorized') continue;
       const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
       const source = await messenger.getChannelMessage(task.channelId, task.messageId, authorizeGuild);
       if (!source) {
@@ -1565,7 +1584,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const sourceMessage: TaskReminderMessage = {
         ...source, guildId: task.guildId, mentionedUserIds: source.mentionedUserIds ?? [],
       };
-      const afterEdit = applySourceEdit(task, sourceMessage);
+      const afterEdit = applySourceEdit(task, sourceMessage, this.now());
       if (afterEdit.revision !== task.revision) {
         task = await this.saveTaskUpdate(key, task.revision, afterEdit) ?? task;
         if (task.status !== 'open' || task.revision !== storedTask.revision) continue;
@@ -1630,6 +1649,16 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   ): Promise<boolean> {
     let task = await this.ctx.storage.get<TrackedTask>(key) ?? initialTask;
     let scan = task.threadScan;
+    if (scan) {
+      try {
+        scan.messages = await this.authorizedTaskMessages(scan.messages);
+        task = await this.saveTaskUpdate(key, task.revision, { ...task, threadScan: scan }) ?? task;
+      } catch {
+        const { threadScan: _scan, ...withoutScan } = task;
+        await this.saveTaskUpdate(key, task.revision, withoutScan);
+        throw new Error('Discord member authorization is unavailable.');
+      }
+    }
     let pageCount = 0;
     const cursor = task.threadCursor ?? task.messageId;
     while (pageCount < TASK_MAX_PAGES_PER_SCAN) {
@@ -1639,12 +1668,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const highWaterId = scan?.highWaterId ?? messages.reduce(
         (max, message) => BigInt(message.id) > BigInt(max) ? message.id : max, cursor,
       );
-      const newMessages = messages.filter((message) => BigInt(message.id) > BigInt(cursor));
+      const newMessages = await this.authorizedTaskMessages(messages.filter((message) => BigInt(message.id) > BigInt(cursor)));
       const buffered = [...(scan?.messages ?? []), ...newMessages];
       const reachedCursor = messages.some((message) => BigInt(message.id) <= BigInt(cursor));
       const complete = reachedCursor || !page.nextBefore || !messages.length;
       if (complete) {
-        const authorized = await this.authorizedTaskMessages(buffered, ownerEmail);
+        const authorized = await this.authorizedTaskMessages(buffered);
         authorized.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
         for (const message of authorized) {
           task = await this.ctx.storage.get<TrackedTask>(key) ?? task;
@@ -1711,13 +1740,19 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         const eventRevision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
         const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
         const link = ownerEmail ? await this.getLinkedDiscordAccount(ownerEmail) : null;
-        if (!task || !ownerEmail || !link || task.ownerId !== link.userId || task.status !== 'open' ||
-            task.revision !== eventRevision || !this.taskReminderChannels().includes(task.channelId)) {
+        if (!task || !ownerEmail || !link || task.ownerId !== link.userId ||
+            (delivery.event.name === TASK_REMINDER_EVENT_NAME && (task.status !== 'open' || task.revision !== eventRevision)) ||
+            !this.taskReminderChannels().includes(task.channelId)) {
           await this.ctx.storage.delete(key);
           continue;
         }
         try {
-          if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) {
+          const sourceAccess = await this.isAuthorizedMember(task.guildId, task.sourceAuthorId);
+          if (sourceAccess.status === 'unavailable') {
+            await this.retryDelivery(key, delivery);
+            continue;
+          }
+          if (sourceAccess.status !== 'authorized' || !await this.isChannelAuthorized(ownerEmail, task.guildId)) {
             await this.ctx.storage.delete(key);
             continue;
           }
@@ -1726,20 +1761,46 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
           continue;
         }
       }
-      let status = 0;
-      try {
-        validateCallbackUrl(subscription.url);
-        const result = await postSignedEvent(subscription, delivery.event, this.webhookFetch, this.now());
-        status = result.status;
-        if (result.accepted || status === 410 || status === 413) {
-          await this.ctx.storage.delete(key);
-          continue;
-        }
-      } catch {
-        status = 0;
+      if (!mentionEvent) {
+        await this.withTaskDeliveryLock(async () => {
+          // Authorization awaits may have let an owner update delete this event.
+          // Serialize the final check, signing, send and retry with owner updates.
+          const pending = await this.ctx.storage.get<PendingDelivery>(key);
+          const latest = taskId ? await this.ctx.storage.get<TrackedTask>(taskKey(taskId)) : undefined;
+          if (!pending || !latest || pending.nextAttemptAt > this.now() ||
+              pending.attempts !== delivery.attempts || pending.event.eventId !== delivery.event.eventId) return;
+          const revision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
+          if (delivery.event.name === TASK_REMINDER_EVENT_NAME &&
+              (latest.status !== 'open' || latest.revision !== revision)) {
+            await this.ctx.storage.delete(key);
+            return;
+          }
+          await this.sendDelivery(key, subscription, delivery);
+        });
+      } else {
+        await this.sendDelivery(key, subscription, delivery);
       }
-      await this.retryDelivery(key, delivery);
     }
+  }
+
+  private withTaskDeliveryLock<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.taskDeliveryTail.then(work);
+    this.taskDeliveryTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private async sendDelivery(key: string, subscription: EventSubscription, delivery: PendingDelivery): Promise<void> {
+    try {
+      validateCallbackUrl(subscription.url);
+      const result = await postSignedEvent(subscription, delivery.event, this.webhookFetch, this.now());
+      if (result.accepted || result.status === 410 || result.status === 413) {
+        await this.ctx.storage.delete(key);
+        return;
+      }
+    } catch {
+      // Preserve the existing bounded retry policy for failed/uncertain sends.
+    }
+    await this.retryDelivery(key, delivery);
   }
 
   private async isSubscriptionAuthorized(subscription: EventSubscription): Promise<boolean> {
@@ -1767,15 +1828,20 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   }
 
   private async retryDelivery(key: string, delivery: PendingDelivery): Promise<void> {
-    const attempts = delivery.attempts + 1;
-    if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-      await this.ctx.storage.delete(key);
-      return;
-    }
-    await this.ctx.storage.put<PendingDelivery>(key, {
-      ...delivery,
-      attempts,
-      nextAttemptAt: this.now() + retryDelayMs(attempts),
+    await this.ctx.storage.transaction(async (transaction) => {
+      const pending = await transaction.get<PendingDelivery>(key);
+      // A concurrent owner update/unsubscribe may have removed this event, or
+      // another delivery pass may already have rescheduled it. Never resurrect it.
+      if (!pending || pending.event.eventId !== delivery.event.eventId ||
+          pending.attempts !== delivery.attempts || pending.nextAttemptAt !== delivery.nextAttemptAt) return;
+      const attempts = delivery.attempts + 1;
+      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+        await transaction.delete(key);
+        return;
+      }
+      await transaction.put<PendingDelivery>(key, {
+        ...delivery, attempts, nextAttemptAt: this.now() + retryDelayMs(attempts),
+      });
     });
   }
 
