@@ -140,18 +140,21 @@ export function applyTaskFollowup(task: TrackedTask, message: TaskReminderMessag
   return task;
 }
 
-export function applySourceEdit(task: TrackedTask, message: TaskReminderMessage): TrackedTask {
+export function applySourceEdit(task: TrackedTask, message: TaskReminderMessage, now = Date.parse(message.timestamp)): TrackedTask {
   if (message.id !== task.messageId || message.content === task.text || task.status !== 'open') return task;
   const candidate = task.ownership === 'assigned'
     ? detectTask(message, task.ownerId)
     : detectCommitment(message, task.ownerId);
-  if (!candidate) return { ...task, revision: task.revision + 1, status: 'cancelled', text: message.content, lastActivityAt: Date.parse(message.timestamp) };
+  // Processing time resets the reminder, but must not suppress real follow-ups
+  // whose Discord timestamps precede this sweep. Keep activity ordering separate.
+  const lastActivityAt = Math.max(task.lastActivityAt, Date.parse(message.timestamp));
+  if (!candidate) return { ...task, revision: task.revision + 1, status: 'cancelled', text: message.content, lastActivityAt };
   return {
     ...task,
     revision: task.revision + 1,
     text: message.content,
-    lastActivityAt: Date.parse(message.timestamp),
-    nextReminderAt: Date.parse(message.timestamp) + TASK_INITIAL_REMINDER_MS,
+    lastActivityAt,
+    nextReminderAt: now + TASK_INITIAL_REMINDER_MS,
   };
 }
 

@@ -659,7 +659,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       await transaction.put(key, updated);
       const deliveries = await transaction.list<PendingDelivery>({ prefix: DELIVERY_PREFIX });
       for (const [deliveryKey, delivery] of deliveries) {
-        if ('task_id' in delivery.event.data && delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
+        if (delivery.event.name === TASK_REMINDER_EVENT_NAME && 'task_id' in delivery.event.data &&
+            delivery.event.data.task_id === taskId) await transaction.delete(deliveryKey);
       }
       return { ok: true, task: updated };
     });
@@ -1404,6 +1405,18 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     let pageCount = 0;
     const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
 
+    if (scan) {
+      try {
+        scan.messages = await this.authorizedTaskMessages(scan.messages);
+        await this.ctx.storage.put(scanKey, scan);
+      } catch {
+        // Discard a legacy/resumed buffer whose current grants cannot be established.
+        // The committed cursor is unchanged, so the next sweep can safely restart.
+        await this.ctx.storage.delete(scanKey);
+        throw new Error('Discord member authorization is unavailable.');
+      }
+    }
+
     if (!scan) {
       const page = await messenger.listChannelMessages(channelId, undefined, TASK_PAGE_SIZE, authorizeGuild);
       if (!page.messages.length) return true;
@@ -1415,7 +1428,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         highWaterId,
         cursor,
         cutoffAt,
-        messages: eligibleTaskMessages(messages, cursor, cutoffAt),
+        messages: await this.authorizedTaskMessages(eligibleTaskMessages(messages, cursor, cutoffAt)),
       };
       pageCount = 1;
       if (pageBoundaryReached(messages, cursor, cutoffAt, page.nextBefore)) {
@@ -1429,7 +1442,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const page = await messenger.listChannelMessages(channelId, scan.before, TASK_PAGE_SIZE, authorizeGuild);
       pageCount += 1;
       const messages = toTaskMessages(page.guildId, page.messages);
-      scan.messages.push(...eligibleTaskMessages(messages, scan.cursor, scan.cutoffAt));
+      scan.messages.push(...await this.authorizedTaskMessages(eligibleTaskMessages(messages, scan.cursor, scan.cutoffAt)));
       if (pageBoundaryReached(messages, scan.cursor, scan.cutoffAt, page.nextBefore)) {
         await this.finishTaskChannelScan(scanKey, cursorKey, scan, ownerId, ownerEmail, subscriptions);
         return true;
@@ -1452,14 +1465,14 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     ownerEmail: string,
     subscriptions: EventSubscription[],
   ): Promise<void> {
-    const authorizedMessages = await this.authorizedTaskMessages(scan.messages, ownerEmail);
+    const authorizedMessages = await this.authorizedTaskMessages(scan.messages);
     authorizedMessages.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
     await this.processTaskMessages(authorizedMessages, ownerId, subscriptions);
     await this.ctx.storage.put(cursorKey, scan.highWaterId);
     await this.ctx.storage.delete(scanKey);
   }
 
-  private async authorizedTaskMessages(messages: TaskReminderMessage[], ownerEmail: string): Promise<TaskReminderMessage[]> {
+  private async authorizedTaskMessages(messages: TaskReminderMessage[]): Promise<TaskReminderMessage[]> {
     const allowed: TaskReminderMessage[] = [];
     const memberAccess = new Map<string, Promise<MemberAuthorizationResult>>();
     for (const message of messages) {
@@ -1490,7 +1503,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
     for (const message of messages) {
       for (const [key, task] of tasks) {
         if (task.status !== 'open' || task.guildId !== message.guildId) continue;
-        let updated = applySourceEdit(task, message);
+        let updated = applySourceEdit(task, message, this.now());
         updated = applyTaskFollowup(updated, message, ownerId);
         if (updated.revision === task.revision) continue;
         const saved = await this.ctx.storage.transaction(async (transaction) => {
@@ -1556,6 +1569,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       let task = storedTask;
       if (!channels.has(task.channelId) || task.ownerId !== link.userId || !shouldSendReminder(task, this.now())) continue;
       if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) continue;
+      const sourceAccess = await this.isAuthorizedMember(task.guildId, task.sourceAuthorId);
+      if (sourceAccess.status !== 'authorized') continue;
       const authorizeGuild = (guildId: string) => this.isChannelAuthorized(ownerEmail, guildId);
       const source = await messenger.getChannelMessage(task.channelId, task.messageId, authorizeGuild);
       if (!source) {
@@ -1565,7 +1580,7 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const sourceMessage: TaskReminderMessage = {
         ...source, guildId: task.guildId, mentionedUserIds: source.mentionedUserIds ?? [],
       };
-      const afterEdit = applySourceEdit(task, sourceMessage);
+      const afterEdit = applySourceEdit(task, sourceMessage, this.now());
       if (afterEdit.revision !== task.revision) {
         task = await this.saveTaskUpdate(key, task.revision, afterEdit) ?? task;
         if (task.status !== 'open' || task.revision !== storedTask.revision) continue;
@@ -1630,6 +1645,16 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   ): Promise<boolean> {
     let task = await this.ctx.storage.get<TrackedTask>(key) ?? initialTask;
     let scan = task.threadScan;
+    if (scan) {
+      try {
+        scan.messages = await this.authorizedTaskMessages(scan.messages);
+        task = await this.saveTaskUpdate(key, task.revision, { ...task, threadScan: scan }) ?? task;
+      } catch {
+        const { threadScan: _scan, ...withoutScan } = task;
+        await this.saveTaskUpdate(key, task.revision, withoutScan);
+        throw new Error('Discord member authorization is unavailable.');
+      }
+    }
     let pageCount = 0;
     const cursor = task.threadCursor ?? task.messageId;
     while (pageCount < TASK_MAX_PAGES_PER_SCAN) {
@@ -1639,12 +1664,12 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
       const highWaterId = scan?.highWaterId ?? messages.reduce(
         (max, message) => BigInt(message.id) > BigInt(max) ? message.id : max, cursor,
       );
-      const newMessages = messages.filter((message) => BigInt(message.id) > BigInt(cursor));
+      const newMessages = await this.authorizedTaskMessages(messages.filter((message) => BigInt(message.id) > BigInt(cursor)));
       const buffered = [...(scan?.messages ?? []), ...newMessages];
       const reachedCursor = messages.some((message) => BigInt(message.id) <= BigInt(cursor));
       const complete = reachedCursor || !page.nextBefore || !messages.length;
       if (complete) {
-        const authorized = await this.authorizedTaskMessages(buffered, ownerEmail);
+        const authorized = await this.authorizedTaskMessages(buffered);
         authorized.sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
         for (const message of authorized) {
           task = await this.ctx.storage.get<TrackedTask>(key) ?? task;
@@ -1711,13 +1736,19 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
         const eventRevision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
         const ownerEmail = this.env.ACCESS_OWNER_EMAIL?.trim().toLowerCase();
         const link = ownerEmail ? await this.getLinkedDiscordAccount(ownerEmail) : null;
-        if (!task || !ownerEmail || !link || task.ownerId !== link.userId || task.status !== 'open' ||
-            task.revision !== eventRevision || !this.taskReminderChannels().includes(task.channelId)) {
+        if (!task || !ownerEmail || !link || task.ownerId !== link.userId ||
+            (delivery.event.name === TASK_REMINDER_EVENT_NAME && (task.status !== 'open' || task.revision !== eventRevision)) ||
+            !this.taskReminderChannels().includes(task.channelId)) {
           await this.ctx.storage.delete(key);
           continue;
         }
         try {
-          if (!await this.isChannelAuthorized(ownerEmail, task.guildId)) {
+          const sourceAccess = await this.isAuthorizedMember(task.guildId, task.sourceAuthorId);
+          if (sourceAccess.status === 'unavailable') {
+            await this.retryDelivery(key, delivery);
+            continue;
+          }
+          if (sourceAccess.status !== 'authorized' || !await this.isChannelAuthorized(ownerEmail, task.guildId)) {
             await this.ctx.storage.delete(key);
             continue;
           }
