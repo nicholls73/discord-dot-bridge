@@ -363,6 +363,35 @@ describe('task reminder authorization boundaries', () => {
     expect(await storage.get('delivery:race')).toBeUndefined();
   });
 
+  it('does not recreate a reminder cancelled during an unavailable authorization check', async () => {
+    const { storage, internal, subscription, callback } = fixture();
+    const tracked = task();
+    await storage.put(taskKey(tracked.id), tracked);
+    await storage.put(`subscription:${subscription.id}`, subscription);
+    await storage.put('delivery:race', { subscriptionId: subscription.id,
+      event: toTaskEvent(tracked, TASK_REMINDER_EVENT_NAME, time), attempts: 0, nextAttemptAt: time });
+    internal.isAuthorizedMember.mockImplementation(async () => {
+      await internal.updateTask('owner@example.test', tracked.id, 1, 'cancel');
+      return { status: 'unavailable' };
+    });
+    await internal.processDueDeliveries();
+    expect(callback).not.toHaveBeenCalled();
+    expect(await storage.get('delivery:race')).toBeUndefined();
+  });
+
+  it('does not immediately retry a failed event from a concurrent delivery snapshot', async () => {
+    const { storage, internal, subscription, callback } = fixture();
+    const tracked = task();
+    await storage.put(taskKey(tracked.id), tracked);
+    await storage.put(`subscription:${subscription.id}`, subscription);
+    await storage.put('delivery:race', { subscriptionId: subscription.id,
+      event: toTaskEvent(tracked, TASK_REMINDER_EVENT_NAME, time), attempts: 0, nextAttemptAt: time });
+    callback.mockResolvedValue(new Response(null, { status: 503 }));
+    await Promise.all([internal.processDueDeliveries(), internal.processDueDeliveries()]);
+    expect(callback).toHaveBeenCalledOnce();
+    expect(await storage.get('delivery:race')).toMatchObject({ attempts: 1 });
+  });
+
   it('orders an owner update after an already-started send, without resurrecting a failed reminder', async () => {
     const { storage, internal, subscription, callback } = fixture();
     const tracked = task();

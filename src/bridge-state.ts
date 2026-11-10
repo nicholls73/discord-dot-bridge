@@ -1767,7 +1767,8 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
           // Serialize the final check, signing, send and retry with owner updates.
           const pending = await this.ctx.storage.get<PendingDelivery>(key);
           const latest = taskId ? await this.ctx.storage.get<TrackedTask>(taskKey(taskId)) : undefined;
-          if (!pending || !latest) return;
+          if (!pending || !latest || pending.nextAttemptAt > this.now() ||
+              pending.attempts !== delivery.attempts || pending.event.eventId !== delivery.event.eventId) return;
           const revision = 'revision' in delivery.event.data ? delivery.event.data.revision : -1;
           if (delivery.event.name === TASK_REMINDER_EVENT_NAME &&
               (latest.status !== 'open' || latest.revision !== revision)) {
@@ -1827,15 +1828,20 @@ export class BridgeStateDO extends DurableObject<Env> implements OriginStore, Me
   }
 
   private async retryDelivery(key: string, delivery: PendingDelivery): Promise<void> {
-    const attempts = delivery.attempts + 1;
-    if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-      await this.ctx.storage.delete(key);
-      return;
-    }
-    await this.ctx.storage.put<PendingDelivery>(key, {
-      ...delivery,
-      attempts,
-      nextAttemptAt: this.now() + retryDelayMs(attempts),
+    await this.ctx.storage.transaction(async (transaction) => {
+      const pending = await transaction.get<PendingDelivery>(key);
+      // A concurrent owner update/unsubscribe may have removed this event, or
+      // another delivery pass may already have rescheduled it. Never resurrect it.
+      if (!pending || pending.event.eventId !== delivery.event.eventId ||
+          pending.attempts !== delivery.attempts || pending.nextAttemptAt !== delivery.nextAttemptAt) return;
+      const attempts = delivery.attempts + 1;
+      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+        await transaction.delete(key);
+        return;
+      }
+      await transaction.put<PendingDelivery>(key, {
+        ...delivery, attempts, nextAttemptAt: this.now() + retryDelayMs(attempts),
+      });
     });
   }
 
