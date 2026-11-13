@@ -38,7 +38,7 @@
     "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "esbuild": "0.28.1",
+    "esbuild": "0.28.2",
     "miniflare": "5.20261104.0-beta",
     "tailwindcss": "4.3.0",
     "typescript": "7.0.2",
